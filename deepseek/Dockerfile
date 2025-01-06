@@ -9,12 +9,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制应用代码
-COPY certificate.crt .
-COPY private.key .
-COPY deepseek.py .
+COPY app.py .
 
 # 暴露端口
-EXPOSE 443
+EXPOSE 80
 
 # 启动应用
-CMD ["python", "deepseek.py"]
+CMD ["python", "app.py"]
