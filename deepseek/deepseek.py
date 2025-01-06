@@ -112,7 +112,7 @@ def send_reply(reply_xml_list):
         return response  # 返回第一个消息时直接响应
 
 # 微信服务器验证和消息处理
-@app.route('/', methods=['GET', 'POST'])
+@app.route('/wechat', methods=['GET', 'POST'])
 def wechat():
     """
     处理微信服务器的验证和消息推送。
