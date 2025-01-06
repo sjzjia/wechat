@@ -152,6 +152,7 @@ def wechat():
         # 同步发送所有回复
         return send_reply(reply_xml_list)  # 发送所有的回复
 
-# 启动 Flask 应用（HTTP）
+# 启动 Flask 应用（HTTPS）
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=80)
+    # 使用 SSL 证书和密钥启用 HTTPS
+    app.run(host='0.0.0.0', port=443, ssl_context=('certificate.crt', 'private.key'))
