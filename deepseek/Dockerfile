@@ -10,7 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制应用代码
 COPY certificate.crt .
-COPY private.key
+COPY private.key .
 COPY deepseek.py .
 
 # 暴露端口
