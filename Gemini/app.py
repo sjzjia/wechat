@@ -19,8 +19,8 @@ handler.setFormatter(formatter)
 app.logger.addHandler(handler)
 
 # 微信公众号配置
-WECHAT_TOKEN = os.environ.get("WECHAT_TOKEN")  # 与公众号后台配置的 Token 一致
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")  # 从环境变量读取 OpenAI API 密钥
+WECHAT_TOKEN = os.environ.get("WECHAT_TOKEN")  # 从环境变量读取微信公众号Token
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")  # 从环境变量读取 Genmini API 密钥
 genai.configure(api_key=GEMINI_API_KEY)
 
 # 验证微信服务器
