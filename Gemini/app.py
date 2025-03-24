@@ -11,23 +11,20 @@ import os
 app = Flask(__name__)
 
 # 开启 Flask 的日志显示
-app.logger.setLevel(logging.DEBUG)  # 设置日志级别为 DEBUG
-handler = logging.StreamHandler()  # 控制台输出日志
+app.logger.setLevel(logging.DEBUG)
+handler = logging.StreamHandler()
 handler.setLevel(logging.DEBUG)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 app.logger.addHandler(handler)
 
 # 微信公众号配置
-WECHAT_TOKEN = "WECHAT_TOKEN"  # 与公众号后台配置的 Token 一致
-GEMINI_API_KEY = "GEMINI_API_KEY"  # 替换为您的 Gemini API 密钥
-genai.configure(api_key=GEMINI_API_KEY)  # 配置 Gemini API 密钥
+WECHAT_TOKEN = os.environ.get("WECHAT_TOKEN")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+genai.configure(api_key=GEMINI_API_KEY)
 
 # 验证微信服务器
 def check_signature(signature, timestamp, nonce):
-    """
-    验证微信服务器的签名。
-    """
     tmp_list = sorted([WECHAT_TOKEN, timestamp, nonce])
     tmp_str = ''.join(tmp_list).encode('utf-8')
     tmp_str = hashlib.sha1(tmp_str).hexdigest()
@@ -64,9 +61,6 @@ def split_message(content, max_length=2000):
 
 # 处理用户消息
 def handle_message(xml_data):
-    """
-    处理用户发送的消息，并调用 Gemini API 获取回复。
-    """
     try:
         # 解析 XML 数据
         xml = ET.fromstring(xml_data)
@@ -86,54 +80,50 @@ def handle_message(xml_data):
         reply_content = response.text.strip()
         app.logger.debug(f"Gemini API response: {reply_content}")
 
+        # 将回复内容分成多个部分
+        reply_parts = split_message(reply_content)
+
+        # 构造多条回复消息
+        reply_xml_list = []
+        for part in reply_parts:
+            reply_xml = f"""
+            <xml>
+                <ToUserName><![CDATA[{from_user}]]></ToUserName>
+                <FromUserName><![CDATA[{to_user}]]></FromUserName>
+                <CreateTime>{int(time.time())}</CreateTime>
+                <MsgType><![CDATA[text]]></MsgType>
+                <Content><![CDATA[{part}]]></Content>
+            </xml>
+            """
+            reply_xml_list.append(reply_xml)
+
+        return reply_xml_list
+
+    except ET.ParseError as e:
+        app.logger.error(f"XML parsing error: {e}")
+        return ["<xml><Content><![CDATA[XML 解析错误]]></Content></xml>"]
     except Exception as e:
         app.logger.error(f"Error while handling message: {e}")
-        reply_content = "抱歉，处理消息时发生了错误。"
-
-    # 将回复内容分成多个部分
-    reply_parts = split_message(reply_content)
-
-    # 构造多条回复消息
-    reply_xml_list = []
-    for part in reply_parts:
-        reply_xml = f"""
-        <xml>
-            <ToUserName><![CDATA[{from_user}]]></ToUserName>
-            <FromUserName><![CDATA[{to_user}]]></FromUserName>
-            <CreateTime>{int(time.time())}</CreateTime>
-            <MsgType><![CDATA[text]]></MsgType>
-            <Content><![CDATA[{part}]]></Content>
-        </xml>
-        """
-        reply_xml_list.append(reply_xml)
-
-    return reply_xml_list
+        return ["<xml><Content><![CDATA[抱歉，处理消息时发生了错误。]]></Content></xml>"]
 
 # 发送微信回复消息
 def send_reply(reply_xml):
-    """
-    发送微信回复消息。
-    """
     app.logger.debug(f"Sending reply: {reply_xml}")
     return make_response(reply_xml)
 
 # 异步发送剩余回复
 def send_async_reply(reply_xml_list):
-    """
-    异步发送剩余回复消息。
-    """
     for reply_xml in reply_xml_list[1:]:
-        time.sleep(1)  # 模拟延迟
-        # 在异步线程中显式创建应用上下文
+        time.sleep(1)
         with app.app_context():
-            send_reply(reply_xml)  # 需要确保这个方法能处理发送操作
+            try:
+                send_reply(reply_xml)
+            except Exception as e:
+                app.logger.error(f"Error sending async reply: {e}")
 
 # 微信服务器验证和消息处理
 @app.route('/', methods=['GET', 'POST'])
 def wechat():
-    """
-    处理微信服务器的验证和消息推送。
-    """
     if request.method == 'GET':
         # 验证服务器地址有效性
         signature = request.args.get('signature', '')
