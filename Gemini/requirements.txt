@@ -1,0 +1,5 @@
+flask==2.1.2
+google-generativeai
+httpx==0.23.0
+requests
+Werkzeug==2.0.3
