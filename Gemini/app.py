@@ -7,6 +7,8 @@ import threading
 import logging
 import google.generativeai as genai
 import os
+from PIL import Image
+import io
 
 app = Flask(__name__)
 
@@ -68,13 +70,23 @@ def handle_message(xml_data):
         from_user = xml.find('FromUserName').text
         to_user = xml.find('ToUserName').text
         content = xml.find('Content').text if msg_type == 'text' else ''
+        pic_url = xml.find('PicUrl').text if msg_type == 'image' else ''
 
         # 打印接收到的消息内容
-        app.logger.debug(f"Received message from {from_user}: {content}")
+        app.logger.debug(f"Received message from {from_user}: {content}, pic_url: {pic_url}")
 
         # 调用 Gemini API
-        model = genai.GenerativeModel('gemini-2.0-flash')  # 或者 'gemini-pro-vision'
-        response = model.generate_content(content)
+        model = genai.GenerativeModel('gemini-2.0-flash')  # 使用支持多模态的模型
+        if msg_type == 'text':
+            response = model.generate_content(content)
+        elif msg_type == 'image':
+            try:
+                image_data = requests.get(pic_url).content
+                image = Image.open(io.BytesIO(image_data))
+                response = model.generate_content([content, image])
+            except Exception as e:
+                app.logger.error(f"Error processing image: {e}")
+                return ["<xml><Content><![CDATA[图片处理失败]]></Content></xml>"]
 
         # 获取模型的回复
         reply_content = response.text.strip()
