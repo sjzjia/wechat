@@ -68,14 +68,13 @@ def handle_message(xml_data):
 
         logger.debug(f"Received message from {from_user}: {content}, pic_url: {pic_url}")
 
-        model = genai.GenerativeModel('gemini-2.0-flash')  # 确保使用支持中文的模型
+        model = genai.GenerativeModel('gemini-2.0-flash')
         if msg_type == 'text':
             response = model.generate_content(content)
         elif msg_type == 'image':
             try:
                 image_data = requests.get(pic_url).content
                 image = Image.open(io.BytesIO(image_data))
-                # 添加中文提示
                 chinese_prompt = "请用中文回复。"
                 response = model.generate_content([chinese_prompt, image])
             except Exception as e:
@@ -114,7 +113,9 @@ def handle_message(xml_data):
 # 发送微信回复消息
 def send_reply(reply_xml):
     logger.debug(f"Sending reply: {reply_xml}")
-    return make_response(reply_xml)
+    response = make_response(reply_xml)
+    response.content_type = 'application/xml'
+    return response
 
 # 异步发送剩余回复
 def send_async_reply_worker():
@@ -124,8 +125,8 @@ def send_async_reply_worker():
             break
         try:
             with app.app_context():
-                send_reply(reply_xml)
-            logger.debug(f"Async reply sent: {reply_xml}")
+                response = send_reply(reply_xml)
+                logger.debug(f"Async reply sent: {reply_xml}")
         except Exception as e:
             logger.error(f"Error sending async reply: {e}")
         reply_queue.task_done()
@@ -153,7 +154,6 @@ def wechat():
 
         if reply_xml_list:
             response = send_reply(reply_xml_list[0])
-            response.content_type = 'application/xml'
 
             if len(reply_xml_list) > 1:
                 for reply_xml in reply_xml_list[1:]:
