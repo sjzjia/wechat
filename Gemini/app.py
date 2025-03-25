@@ -68,14 +68,16 @@ def handle_message(xml_data):
 
         logger.debug(f"Received message from {from_user}: {content}, pic_url: {pic_url}")
 
-        model = genai.GenerativeModel('gemini-2.0-flash')
+        model = genai.GenerativeModel('gemini-2.0-flash')  # 确保使用支持中文的模型
         if msg_type == 'text':
             response = model.generate_content(content)
         elif msg_type == 'image':
             try:
                 image_data = requests.get(pic_url).content
                 image = Image.open(io.BytesIO(image_data))
-                response = model.generate_content([content, image])
+                # 添加中文提示
+                chinese_prompt = "请用中文回复。"
+                response = model.generate_content([chinese_prompt, image])
             except Exception as e:
                 logger.error(f"Error processing image: {e}")
                 return ["<xml><Content><![CDATA[图片处理失败]]></Content></xml>"]
@@ -88,14 +90,14 @@ def handle_message(xml_data):
             reply_xml_list = []
             for part in reply_parts:
                 reply_xml = f"""
-                <xml>
-                    <ToUserName><![CDATA[{from_user}]]></ToUserName>
-                    <FromUserName><![CDATA[{to_user}]]></FromUserName>
-                    <CreateTime>{int(time.time())}</CreateTime>
-                    <MsgType><![CDATA[text]]></MsgType>
-                    <Content><![CDATA[{part}]]></Content>
-                </xml>
-                """
+                    <xml>
+                        <ToUserName><![CDATA[{from_user}]]></ToUserName>
+                        <FromUserName><![CDATA[{to_user}]]></FromUserName>
+                        <CreateTime>{int(time.time())}</CreateTime>
+                        <MsgType><![CDATA[text]]></MsgType>
+                        <Content><![CDATA[{part}]]></Content>
+                    </xml>
+                    """
                 reply_xml_list.append(reply_xml)
             return reply_xml_list
         else:
