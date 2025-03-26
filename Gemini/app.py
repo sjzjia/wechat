@@ -11,6 +11,7 @@ from PIL import Image
 import io
 import queue
 import concurrent.futures
+import traceback
 
 app = Flask(__name__)
 
@@ -24,7 +25,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
 
 # 异步回复队列
-reply_queue = queue.Queue()
+reply_queue = queue.Queue(maxsize=100)  # 设置队列最大长度
 
 # 异步发送回复的线程池
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
@@ -73,12 +74,15 @@ def handle_message(xml_data):
             response = model.generate_content(content)
         elif msg_type == 'image':
             try:
-                image_data = requests.get(pic_url).content
+                image_data = requests.get(pic_url, timeout=10).content #Added timeout
                 image = Image.open(io.BytesIO(image_data))
                 chinese_prompt = "请用中文回复。"
                 response = model.generate_content([chinese_prompt, image])
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Error downloading image: {e}, pic_url: {pic_url}, traceback: {traceback.format_exc()}")
+                return ["<xml><Content><![CDATA[图片下载失败]]></Content></xml>"]
             except Exception as e:
-                logger.error(f"Error processing image: {e}")
+                logger.error(f"Error processing image: {e}, pic_url: {pic_url}, traceback: {traceback.format_exc()}")
                 return ["<xml><Content><![CDATA[图片处理失败]]></Content></xml>"]
 
         if response and response.text:
@@ -100,14 +104,14 @@ def handle_message(xml_data):
                 reply_xml_list.append(reply_xml)
             return reply_xml_list
         else:
-            logger.warning("Gemini API返回空值或无效数据")
-            return ["<xml><Content><![CDATA[Gemini API返回空值或无效数据]]></Content></xml>"]
+            logger.warning("Gemini API 返回空值或无效数据")
+            return ["<xml><Content><![CDATA[Gemini API 返回空值或无效数据]]></Content></xml>"]
 
     except ET.ParseError as e:
-        logger.error(f"XML parsing error: {e}")
+        logger.error(f"XML parsing error: {e}, xml_data: {xml_data}, traceback: {traceback.format_exc()}")
         return ["<xml><Content><![CDATA[XML 解析错误]]></Content></xml>"]
     except Exception as e:
-        logger.error(f"Error while handling message: {e}")
+        logger.error(f"Error while handling message: {e}, xml_data: {xml_data}, traceback: {traceback.format_exc()}")
         return ["<xml><Content><![CDATA[抱歉，处理消息时发生了错误。]]></Content></xml>"]
 
 # 发送微信回复消息
@@ -120,16 +124,19 @@ def send_reply(reply_xml):
 # 异步发送剩余回复
 def send_async_reply_worker():
     while True:
-        reply_xml = reply_queue.get()
-        if reply_xml is None:
-            break
         try:
-            with app.app_context():
-                response = send_reply(reply_xml)
-                logger.debug(f"Async reply sent: {reply_xml}")
-        except Exception as e:
-            logger.error(f"Error sending async reply: {e}")
-        reply_queue.task_done()
+            reply_xml = reply_queue.get(timeout=10) #Add timeout to prevent thread hang.
+            if reply_xml is None:
+                break
+            try:
+                with app.app_context():
+                    response = send_reply(reply_xml)
+                    logger.debug(f"Async reply sent: {reply_xml}")
+            except Exception as e:
+                logger.error(f"Error sending async reply: {e}, reply_xml: {reply_xml}, traceback: {traceback.format_exc()}")
+            reply_queue.task_done()
+        except queue.Empty:
+            logger.debug("Async reply queue is empty.")
 
 # 启动异步回复线程
 executor.submit(send_async_reply_worker)
