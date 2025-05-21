@@ -3,14 +3,11 @@ import time
 import requests
 from flask import Flask, request, make_response
 from xml.etree import ElementTree as ET
-import threading
 import logging
 import google.generativeai as genai
 import os
 from PIL import Image
 import io
-import queue
-import concurrent.futures
 import traceback
 
 app = Flask(__name__)
@@ -23,12 +20,6 @@ logger = logging.getLogger(__name__)
 WECHAT_TOKEN = os.environ.get("WECHAT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
-
-# 异步回复队列
-reply_queue = queue.Queue(maxsize=100)  # 设置队列最大长度
-
-# 异步发送回复的线程池
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
 
 # 微信签名验证
 def check_signature(signature, timestamp, nonce):
@@ -45,7 +36,7 @@ def truncate_message(content, max_length=2000):
         content = content_bytes[:max_length].decode('utf-8', 'ignore')
     return content
 
-# 将内容分成多个部分
+# 将内容分成多个部分 (这个函数现在不直接使用，但保留以备将来可能需要)
 def split_message(content, max_length=2000):
     content_bytes = content.encode('utf-8')
     parts = []
@@ -80,39 +71,80 @@ def handle_message(xml_data):
                 response = model.generate_content([chinese_prompt, image])
             except requests.exceptions.RequestException as e:
                 logger.error(f"Error downloading image: {e}, pic_url: {pic_url}, traceback: {traceback.format_exc()}")
-                return ["<xml><Content><![CDATA[图片下载失败]]></Content></xml>"]
-            except Exception as e:
-                logger.error(f"Error processing image: {e}, pic_url: {pic_url}, traceback: {traceback.format_exc()}")
-                return ["<xml><Content><![CDATA[图片处理失败]]></Content></xml>"]
-
-        if response and response.text:
-            reply_content = response.text.strip()
-            logger.debug(f"Gemini API response: {reply_content}")
-            reply_parts = split_message(reply_content)
-
-            reply_xml_list = []
-            for part in reply_parts:
-                reply_xml = f"""
+                error_reply_xml = f"""
                     <xml>
                         <ToUserName><![CDATA[{from_user}]]></ToUserName>
                         <FromUserName><![CDATA[{to_user}]]></FromUserName>
                         <CreateTime>{int(time.time())}</CreateTime>
                         <MsgType><![CDATA[text]]></MsgType>
-                        <Content><![CDATA[{part}]]></Content>
+                        <Content><![CDATA[图片下载失败]]></Content>
                     </xml>
                     """
-                reply_xml_list.append(reply_xml)
-            return reply_xml_list
+                return error_reply_xml
+            except Exception as e:
+                logger.error(f"Error processing image: {e}, pic_url: {pic_url}, traceback: {traceback.format_exc()}")
+                error_reply_xml = f"""
+                    <xml>
+                        <ToUserName><![CDATA[{from_user}]]></ToUserName>
+                        <FromUserName><![CDATA[{to_user}]]></FromUserName>
+                        <CreateTime>{int(time.time())}</CreateTime>
+                        <MsgType><![CDATA[text]]></MsgType>
+                        <Content><![CDATA[图片处理失败]]></Content>
+                    </xml>
+                    """
+                return error_reply_xml
+
+        if response and response.text:
+            reply_content = response.text.strip()
+            reply_content = truncate_message(reply_content, 2048) # 确保内容长度不超过限制
+            logger.debug(f"Gemini API response: {reply_content}")
+            reply_xml = f"""
+                <xml>
+                    <ToUserName><![CDATA[{from_user}]]></ToUserName>
+                    <FromUserName><![CDATA[{to_user}]]></FromUserName>
+                    <CreateTime>{int(time.time())}</CreateTime>
+                    <MsgType><![CDATA[text]]></MsgType>
+                    <Content><![CDATA[{reply_content}]]></Content>
+                </xml>
+                """
+            return reply_xml
         else:
             logger.warning("Gemini API 返回空值或无效数据")
-            return ["<xml><Content><![CDATA[Gemini API 返回空值或无效数据]]></Content></xml>"]
+            error_reply_xml = f"""
+                <xml>
+                    <ToUserName><![CDATA[{from_user}]]></ToUserName>
+                    <FromUserName><![CDATA[{to_user}]]></FromUserName>
+                    <CreateTime>{int(time.time())}</CreateTime>
+                    <MsgType><![CDATA[text]]></MsgType>
+                    <Content><![CDATA[Gemini API 返回空值或无效数据]]></Content>
+                </xml>
+                """
+            return error_reply_xml
 
     except ET.ParseError as e:
         logger.error(f"XML parsing error: {e}, xml_data: {xml_data}, traceback: {traceback.format_exc()}")
-        return ["<xml><Content><![CDATA[XML 解析错误]]></Content></xml>"]
+        error_reply_xml = f"""
+            <xml>
+                <ToUserName><![CDATA[{from_user}]]></ToUserName>
+                <FromUserName><![CDATA[{to_user}]]></FromUserName>
+                <CreateTime>{int(time.time())}</CreateTime>
+                <MsgType><![CDATA[text]]></MsgType>
+                <Content><![CDATA[XML 解析错误]]></Content>
+            </xml>
+            """
+        return error_reply_xml
     except Exception as e:
         logger.error(f"Error while handling message: {e}, xml_data: {xml_data}, traceback: {traceback.format_exc()}")
-        return ["<xml><Content><![CDATA[抱歉，处理消息时发生了错误。]]></Content></xml>"]
+        error_reply_xml = f"""
+            <xml>
+                <ToUserName><![CDATA[{from_user}]]></ToUserName>
+                <FromUserName><![CDATA[{to_user}]]></FromUserName>
+                <CreateTime>{int(time.time())}</CreateTime>
+                <MsgType><![CDATA[text]]></MsgType>
+                <Content><![CDATA[抱歉，处理消息时发生了错误。]]></Content>
+            </xml>
+            """
+        return error_reply_xml
 
 # 发送微信回复消息
 def send_reply(reply_xml):
@@ -121,25 +153,6 @@ def send_reply(reply_xml):
     response.content_type = 'application/xml'
     return response
 
-# 异步发送剩余回复
-def send_async_reply_worker():
-    while True:
-        try:
-            reply_xml = reply_queue.get(timeout=10) #Add timeout to prevent thread hang.
-            if reply_xml is None:
-                break
-            try:
-                with app.app_context():
-                    response = send_reply(reply_xml)
-                    logger.debug(f"Async reply sent: {reply_xml}")
-            except Exception as e:
-                logger.error(f"Error sending async reply: {e}, reply_xml: {reply_xml}, traceback: {traceback.format_exc()}")
-            reply_queue.task_done()
-        except queue.Empty:
-            logger.debug("Async reply queue is empty.")
-
-# 启动异步回复线程
-executor.submit(send_async_reply_worker)
 
 # 微信服务器验证和消息处理
 @app.route('/', methods=['GET', 'POST'])
@@ -157,15 +170,11 @@ def wechat():
     elif request.method == 'POST':
         xml_data = request.data
         logger.debug(f"POST request data: {xml_data}")
-        reply_xml_list = handle_message(xml_data)
+        reply_xml = handle_message(xml_data) # 直接获取单个 XML 字符串
 
-        if reply_xml_list:
-            response = send_reply(reply_xml_list[0])
-
-            if len(reply_xml_list) > 1:
-                for reply_xml in reply_xml_list[1:]:
-                    reply_queue.put(reply_xml)
-
+        if reply_xml:
+            logger.debug(f"Reply to send: {reply_xml}")
+            response = send_reply(reply_xml)
             logger.debug("Reply sent successfully.")
             return response
         else:
@@ -177,5 +186,4 @@ if __name__ == '__main__':
     try:
         app.run(host='0.0.0.0', port=80)
     finally:
-        reply_queue.put(None)
-        executor.shutdown()
+        pass # No need to shutdown the executor and queue.
