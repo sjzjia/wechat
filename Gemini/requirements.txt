@@ -3,3 +3,4 @@ google-generativeai
 httpx==0.23.0
 requests
 Werkzeug==2.0.3
+Pillow
