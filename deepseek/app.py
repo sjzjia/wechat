@@ -1,202 +1,220 @@
-from flask import Flask, request, make_response
+# -*- coding: utf-8 -*-
+import os
 import hashlib
 import time
 import requests
 from xml.etree import ElementTree as ET
-import threading
+from flask import Flask, request, make_response
 import logging
+from dotenv import load_dotenv
+import re
+
+# 加载环境变量
+load_dotenv()
 
 app = Flask(__name__)
 
-# 在 app 初始化后添加日志配置
+# 日志配置
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('wechat_bot.log'),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
-# 在文件开头添加配置类
 class Config:
-    WECHAT_TOKEN = "YOU_WECHAT_TOKEN"
-    DEEPSEEK_API_KEY = "YOU_DEEPSEEK_API_KEY"
+    # 从环境变量读取配置
+    WECHAT_TOKEN = os.getenv("WECHAT_TOKEN", "")
+    DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
     DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
-    MAX_MESSAGE_LENGTH = 2000
+    MAX_MESSAGE_LENGTH = 2000  # 微信文本消息限制
     MODEL_NAME = "deepseek-chat"
-    MAX_TOKENS = 5000
-    APPID = "YOU_WECHAT_APPID"
-    APPSECRET = "YOU_WECHAT_APPSECRET"
+    MAX_TOKENS = 2000
+    TIMEOUT = 30  # API超时时间(秒)
 
-# 验证微信服务器
 def check_signature(signature, timestamp, nonce):
-    """
-    验证微信服务器的签名。
-    """
+    """验证微信服务器签名"""
+    if not all([signature, timestamp, nonce]):
+        return False
+        
     tmp_list = sorted([Config.WECHAT_TOKEN, timestamp, nonce])
-    tmp_str = ''.join(tmp_list).encode('utf-8')
-    tmp_str = hashlib.sha1(tmp_str).hexdigest()
-    logger.info(f"Signature Validation: expected {tmp_str}, received {signature}")
+    tmp_str = hashlib.sha1("".join(tmp_list).encode('utf-8')).hexdigest()
+    logger.debug(f"Signature check: {tmp_str == signature}")
     return tmp_str == signature
 
-# 截取消息内容
-def truncate_message(content, max_length=None):
-    """
-    截取消息内容，确保不超过最大字节长度。
-    """
-    max_length = max_length or Config.MAX_MESSAGE_LENGTH
-    content_bytes = content.encode('utf-8')
-    if len(content_bytes) > max_length:
-        content = content_bytes[:max_length].decode('utf-8', 'ignore')
-    return content
+def safe_truncate(content, max_length=Config.MAX_MESSAGE_LENGTH):
+    """安全截断文本，保证UTF-8编码不超长"""
+    content = content.strip()
+    encoded = content.encode('utf-8')
+    if len(encoded) <= max_length:
+        return content
+    
+    # 回溯找到最后一个完整字符
+    truncated = encoded[:max_length]
+    try:
+        return truncated.decode('utf-8')
+    except UnicodeDecodeError:
+        return truncated[:-1].decode('utf-8', 'ignore')
 
-# 将内容分成多个部分
-def split_message(content, max_length=None):
+def smart_split(content, max_length=Config.MAX_MESSAGE_LENGTH):
     """
-    将内容分成多个部分，每部分不超过 max_length 字节。
-    优化分割逻辑，确保每部分内容的完整性。
+    智能分割长文本，优先按段落分割
+    返回格式：["【1/3】第一部分", "【2/3】第二部分"...]
     """
-    max_length = max_length or Config.MAX_MESSAGE_LENGTH
+    if len(content.encode('utf-8')) <= max_length:
+        return [content]
     
-    # 计算预留给标记的长度
-    marker_length = len("【XX/XX】\n".encode('utf-8'))
-    effective_length = max_length - marker_length
+    # 计算有效长度（减去分页标记长度）
+    marker_len = len("【XX/XX】".encode('utf-8'))
+    effective_len = max_length - marker_len
     
-    # 按段落分割内容
+    # 分割策略：优先按段落，其次按句子
     parts = []
-    current_part = ''
+    current = ""
     
-    # 按句号分割内容
-    sentences = content.split('。')
+    # 先按双换行分段落
+    paragraphs = [p.strip() for p in content.split('\n\n') if p.strip()]
     
-    for sentence in sentences:
-        if sentence:
-            sentence += '。'  # 添加句号
-            if len((current_part + sentence).encode('utf-8')) > effective_length:
-                # 如果当前部分不为空，保存它
-                if current_part:
-                    parts.append(current_part.strip())
-                current_part = sentence  # 开始新的部分
+    for para in paragraphs:
+        para_bytes = para.encode('utf-8')
+        
+        # 段落可直接放入
+        if len(current.encode('utf-8')) + len(para_bytes) < effective_len:
+            current += f"\n\n{para}" if current else para
+            continue
+            
+        # 当前段落过长需要分割
+        if current:
+            parts.append(current)
+            current = ""
+            
+        # 按句子分割长段落
+        sentences = re.split(r'(?<=[。！？.?!])', para)
+        for sent in sentences:
+            if not sent.strip():
+                continue
+                
+            sent_bytes = sent.encode('utf-8')
+            if len(current.encode('utf-8')) + len(sent_bytes) < effective_len:
+                current += sent
             else:
-                current_part += sentence  # 添加到当前部分
+                if current:
+                    parts.append(current)
+                current = sent[:effective_len]  # 极端情况：单句超长
     
-    # 添加最后一部分
-    if current_part:
-        parts.append(current_part.strip())
+    if current:
+        parts.append(current)
     
-    # 添加序号标记并清理
-    total_parts = len(parts)
-    for i in range(total_parts):
-        marker = f"【{i+1}/{total_parts}】\n" if total_parts > 1 else ""
-        parts[i] = marker + parts[i].strip()
-    
+    # 添加分页标记
+    total = len(parts)
+    if total > 1:
+        return [f"【{i+1}/{total}】{p}" for i, p in enumerate(parts)]
     return parts
 
-# 处理用户消息
-def handle_message(xml_data):
-    """
-    处理用户发送的消息，并调用 DeepSeek API 获取回复。
-    优化消息处理逻辑。
-    """
-    try:
-        xml = ET.fromstring(xml_data)
-        msg_type = xml.find('MsgType').text
-        from_user = xml.find('FromUserName').text
-        to_user = xml.find('ToUserName').text
-        content = xml.find('Content').text if msg_type == 'text' else ''
-
-        try:
-            api_response = call_deepseek_api(content)
-            reply_content = api_response.get('choices')[0].get('message', {}).get('content', '')
-            logger.info("API 返回的原始内容：%s", repr(reply_content))
-            
-            # 清理内容
-            reply_content = reply_content.replace("\r\n", " ").replace("\n", " ")
-            logger.info("清理后的内容：%s", repr(reply_content))
-            
-            # 分割消息
-            parts = split_message(reply_content)
-            if not parts:
-                return create_reply_xml(from_user, to_user, "抱歉，生成的回复内容为空。")
-                
-            # 返回第一部分的 XML
-            return create_reply_xml(from_user, to_user, parts[0])
-            
-        except Exception as e:
-            logger.error("调用 API 失败: %s", str(e))
-            return create_reply_xml(from_user, to_user, "抱歉，我暂时无法处理你的请求。")
-
-    except Exception as e:
-        logger.error("处理消息时发生错误: %s", str(e), exc_info=True)
-        return create_reply_xml(from_user, to_user, "抱歉，处理消息时发生了错误。")
-
-# 微信服务器验证和消息处理
-@app.route('/', methods=['GET', 'POST'])
-def wechat():
-    """
-    处理微信服务器的验证和消息推送。
-    """
-    if request.method == 'GET':
-        # 验证服务器地址有效性
-        signature = request.args.get('signature', '')
-        timestamp = request.args.get('timestamp', '')
-        nonce = request.args.get('nonce', '')
-        echostr = request.args.get('echostr', '')
-        if check_signature(signature, timestamp, nonce):
-            return echostr
-        else:
-            return '验证失败'
-    elif request.method == 'POST':
-        # 处理用户消息
-        xml_data = request.data
-        logger.info("Received XML Data: %s", xml_data)
-        
-        # 获取回复消息
-        reply_xml = handle_message(xml_data)
-        
-        # 设置响应
-        response = make_response(reply_xml)
-        response.content_type = 'application/xml'
-        return response
-
-def call_deepseek_api(content):
-    """
-    封装 DeepSeek API 调用
-    """
+def call_deepseek_api(prompt, retries=2):
+    """调用DeepSeek API（带重试机制）"""
     headers = {
         "Authorization": f"Bearer {Config.DEEPSEEK_API_KEY}",
         "Content-Type": "application/json"
     }
-    data = {
+    payload = {
         "model": Config.MODEL_NAME,
-        "messages": [
-            {"role": "user", "content": content}
-        ],
-        "max_tokens": Config.MAX_TOKENS
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": Config.MAX_TOKENS,
+        "temperature": 0.7
     }
     
-    response = requests.post(
-        Config.DEEPSEEK_API_URL, 
-        json=data, 
-        headers=headers,
-        timeout=30  # 添加超时设置
-    )
-    response.raise_for_status()  # 抛出非200状态码的异常
-    return response.json()
+    for attempt in range(retries):
+        try:
+            resp = requests.post(
+                Config.DEEPSEEK_API_URL,
+                json=payload,
+                headers=headers,
+                timeout=Config.TIMEOUT
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            
+            if not data.get("choices"):
+                raise ValueError("Invalid API response format")
+                
+            return data
+            
+        except (requests.RequestException, ValueError) as e:
+            if attempt == retries - 1:
+                logger.error(f"API调用失败: {str(e)}")
+                raise
+            time.sleep(1)
 
-def create_reply_xml(from_user, to_user, content):
-    """
-    创建回复XML的工具函数
-    """
-    return f"""
-    <xml>
-        <ToUserName><![CDATA[{from_user}]]></ToUserName>
-        <FromUserName><![CDATA[{to_user}]]></FromUserName>
-        <CreateTime>{int(time.time())}</CreateTime>
-        <MsgType><![CDATA[text]]></MsgType>
-        <Content><![CDATA[{content}]]></Content>
-    </xml>
-    """
+def create_reply(from_user, to_user, content):
+    """生成微信回复XML"""
+    return f"""<xml>
+<ToUserName><![CDATA[{from_user}]]></ToUserName>
+<FromUserName><![CDATA[{to_user}]]></FromUserName>
+<CreateTime>{int(time.time())}</CreateTime>
+<MsgType><![CDATA[text]]></MsgType>
+<Content><![CDATA[{content}]]></Content>
+</xml>"""
 
-# 启动 Flask 应用（HTTP）
+@app.route('/', methods=['GET', 'POST'])
+def wechat_handler():
+    """微信消息处理入口"""
+    if request.method == 'GET':
+        # 验证服务器
+        sig = request.args.get('signature', '')
+        timestamp = request.args.get('timestamp', '')
+        nonce = request.args.get('nonce', '')
+        echostr = request.args.get('echostr', '')
+        
+        if check_signature(sig, timestamp, nonce):
+            return echostr
+        return "Invalid signature", 403
+    
+    # 处理POST消息
+    try:
+        xml = ET.fromstring(request.data)
+        msg_type = xml.find('MsgType').text
+        from_user = xml.find('FromUserName').text
+        to_user = xml.find('ToUserName').text
+        
+        # 只处理文本消息
+        if msg_type != 'text':
+            return create_reply(from_user, to_user, "暂仅支持文本消息")
+            
+        content = xml.find('Content').text
+        if not content.strip():
+            return create_reply(from_user, to_user, "消息内容为空")
+        
+        # 调用AI接口
+        try:
+            response = call_deepseek_api(content)
+            ai_reply = response['choices'][0]['message']['content']
+            
+            # 清理回复内容
+            ai_reply = re.sub(r'\s+', ' ', ai_reply).strip()
+            reply_part = safe_truncate(ai_reply)
+            
+            return create_reply(from_user, to_user, reply_part)
+            
+        except Exception as api_error:
+            logger.error(f"AI处理失败: {str(api_error)}")
+            return create_reply(from_user, to_user, "AI服务暂时不可用，请稍后再试")
+            
+    except Exception as e:
+        logger.error(f"消息处理异常: {str(e)}")
+        return create_reply(from_user, to_user, "服务器处理消息时出错")
+
 if __name__ == '__main__':
-    # 启动 HTTP 服务器
-    app.run(host='0.0.0.0', port=80)
+    # 检查关键配置
+    if not all([Config.WECHAT_TOKEN, Config.DEEPSEEK_API_KEY]):
+        raise ValueError("缺少必要的环境变量配置")
+    
+    # 启动服务（生产环境应使用WSGI服务器）
+    app.run(
+        host='0.0.0.0',
+        port=80,
+        debug=os.getenv('FLASK_DEBUG', 'false').lower() == 'true'
+    )
