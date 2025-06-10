@@ -15,12 +15,13 @@ from datetime import datetime
 import textwrap
 import threading
 import redis
-import ipaddress # 新增
-from urllib.parse import urlparse # 新增
+import ipaddress
+from urllib.parse import urlparse
+import socket # 新增导入
 
 app = Flask(__name__)
 
-# ==================== 常量定义 (保持不变) ====================
+# ==================== 常量定义 ====================
 QUERY_IMAGE_RESULT_COMMAND = "查询图片结果"
 INITIAL_IMAGE_PROCESSING_MESSAGE = "图片已收到，AI正在努力识别中，请耐心等待10-20秒后发送“查询图片结果”来获取。[抱拳]"
 UNSUPPORTED_MESSAGE_TYPE_REPLY = "暂不支持该类型的消息，请发送文本或图片。"
@@ -33,15 +34,14 @@ IMAGE_QUERY_PARSE_ERROR_REPLY = "抱歉，无法解析存储的图片识别结�
 AI_REPLY_TOO_LONG_IMAGE_FAIL_PREFIX = "AI回复超长，转图片失败。以下为截断内容：\n"
 AI_REPLY_EXCEPTION_REPLY = "AI回复异常，请稍后重试。"
 ACCESS_TOKEN_FETCH_FAILED_REPLY = "抱歉，无法获取微信服务凭证，请联系管理员。"
-UNSAFE_URL_REPLY = "抱歉，检测到图片链接可能存在安全风险，已拒绝处理。" # 新增
+UNSAFE_URL_REPLY = "抱歉，检测到图片链接可能存在安全风险，已拒绝处理。"
 
 REDIS_USER_AI_RESULT_PREFIX = "wechat_ai_result:"
 REDIS_TEXT_CACHE_PREFIX = "wechat_text_cache:"
 AI_RESULT_EXPIRATION_SECONDS = 24 * 3600
 TEXT_CACHE_EXPIRATION_SECONDS = 6 * 3600
 
-# ==================== 初始化配置 (保持不变，或根据您实际情况调整) ====================
-# ... (setup_logging, logger, 环境变量校验, Gemini 配置, Redis 配置和连接等) ...
+# ==================== 初始化配置 ====================
 def setup_logging():
     """配置详细的日志记录系统"""
     log_format = '%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s'
@@ -132,7 +132,7 @@ except Exception as e:
     logger.critical(f"Redis 初始化失败: {e}")
     raise RuntimeError(f"Redis 初始化失败: {e}")
 
-# ==================== 核心功能 - Access Token (保持不变) ====================
+# ==================== 核心功能 - Access Token ====================
 access_token_cache = {"token": None, "expires_at": 0}
 token_lock = threading.Lock()
 
@@ -182,7 +182,7 @@ def verify_wechat_config():
 if not verify_wechat_config():
     raise RuntimeError("微信配置验证失败，服务无法启动。请检查环境变量和网络。")
 
-# ==================== 微信验证接口 (保持不变) ====================
+# ==================== 微信验证接口 ====================
 @app.route('/', methods=['GET'])
 def wechat_verify():
     try:
@@ -236,29 +236,34 @@ def check_signature(signature, timestamp, nonce):
         logger.error(f"签名验证过程中发生异常: {e}\n{traceback.format_exc()}")
         return False
 
-# ==================== SSRF 防范辅助函数 ====================
+# ==================== SSRF 防范辅助函数 (增强版) ====================
 
 def is_private_ip(ip_str):
     """检查一个 IP 地址是否属于私有网络范围或特殊用途IP"""
     try:
         ip = ipaddress.ip_address(ip_str)
-        # 检查是否是私有 IP、回环 IP、链路本地 IP 等
+        # 检查是否是私有 IP (RFC1918)、回环 IP、链路本地 IP、多播 IP、保留 IP
         return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved
     except ValueError:
-        return False # 不是有效的IP地址
+        # 如果 ip_str 不是一个有效的 IP 地址格式，则认为不是私有 IP
+        return False
 
-def is_safe_url(url):
+def is_safe_url(url, dns_timeout=2):
     """
-    检查 URL 是否安全，以防范 SSRF 攻击。
-    这是一个基础的检查，无法防范所有高级攻击，但能有效阻止常见的内网探测。
+    增强版检查 URL 是否安全，以防范 SSRF 攻击，包括 DNS 解析结果检查。
+    
+    参数:
+    url (str): 要检查的 URL。
+    dns_timeout (int): DNS 解析的超时时间（秒）。
     
     检查项：
     1. 协议必须是 HTTP 或 HTTPS。
     2. 主机名必须存在。
-    3. 解析主机名对应的IP地址，确保不属于私有网络或回环地址。
-    4. 端口必须是标准端口（80, 443）或未指定。
+    3. 端口必须是标准端口（80, 443）或未指定。
+    4. 对主机名进行 DNS 解析，确保所有解析到的 IP 地址不属于私有网络或特殊用途IP。
     """
     if not url:
+        logger.warning("URL为空，拒绝处理。")
         return False
     
     try:
@@ -266,7 +271,7 @@ def is_safe_url(url):
 
         # 1. 协议检查
         if parsed_url.scheme not in ('http', 'https'):
-            logger.warning(f"不安全的URL协议: {parsed_url.scheme} for {url}")
+            logger.warning(f"不安全的URL协议: {parsed_url.scheme} for URL: {url}")
             return False
 
         # 2. 主机名检查
@@ -275,42 +280,56 @@ def is_safe_url(url):
             return False
         
         # 3. 端口检查 (可选，但推荐)
+        # 如果端口指定了，必须是 80 或 443
         if parsed_url.port is not None and parsed_url.port not in (80, 443):
-            logger.warning(f"非标准或不安全的URL端口: {parsed_url.port} for {url}")
+            logger.warning(f"非标准或不安全的URL端口: {parsed_url.port} for URL: {url}")
             return False
 
         # 4. IP 地址检查 (核心 SSRF 防范)
-        # requests 库在发起请求时会自动进行DNS解析，但为了提前检查，我们自己进行一次
-        # 注意：这里可能会引入DNS解析耗时，且存在DNS Rebinding风险 (高级攻击，需要更复杂的防御)
-        # 对于微信这种可信来源，通常DNS解析会直接返回公共IP
         try:
-            # 使用 socket.gethostbyname_ex 来获取所有IP地址
-            # 注意：不建议直接用 socket.gethostbyname，因为它可能只返回一个IP
-            # 这里用 requests 库的 gethostbyname 更保险，因为它内部处理了多种情况
-            # 或者直接依赖 requests 内部的DNS解析，我们只检查最终连接的IP。
-            # 但为了提前阻止，我们可以在这里做初步检查。
-
-            # 简单起见，我们假设 requests 内部解析的IP是可靠的，
-            # 这里的检查是针对 URL 中直接包含 IP 的情况，或首次 DNS 解析的情况。
-            # 如果是域名，requests 内部会解析，我们无法在这里直接拦截最终连接的IP。
-            # 更完善的方案是使用 requests.resolve_ip 或者在网络层限制。
-            
-            # 为了简单有效，我们只在 URL 包含 IP 时进行检查
-            ip_pattern = r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$"
-            if re.match(ip_pattern, parsed_url.hostname):
+            # 尝试直接解析主机名，如果它是 IP 地址，直接检查
+            if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", parsed_url.hostname) or \
+               (parsed_url.hostname.count(':') >= 2 and parsed_url.hostname.count('.') == 0): # 简单的IPv6判断
                 if is_private_ip(parsed_url.hostname):
-                    logger.warning(f"URL主机是私有IP地址: {parsed_url.hostname} for {url}")
+                    logger.warning(f"URL主机是私有IP地址: {parsed_url.hostname} for URL: {url}")
                     return False
-            # 对于域名，我们不在这里进行 DNS 解析来获取 IP，因为 requests 会在内部做。
-            # 这里的重点是防止直接传入私有 IP。
-            
-            # 如果需要更彻底的DNS解析验证，可以考虑使用 dns.resolver 库，
-            # 并对所有解析到的 IP 进行 is_private_ip 检查。
-            # 但那会增加复杂性和依赖。
-            
+            else:
+                # 对于域名，进行 DNS 解析
+                original_timeout = socket.getdefaulttimeout()
+                socket.setdefaulttimeout(dns_timeout)
+                
+                resolved_ips = set()
+                try:
+                    addr_info = socket.getaddrinfo(
+                        parsed_url.hostname, 
+                        parsed_url.port if parsed_url.port else parsed_url.scheme, 
+                        socket.AF_UNSPEC, 
+                        socket.SOCK_STREAM
+                    )
+                    
+                    for info in addr_info:
+                        ip_address = info[4][0] # info[4] 是 socket address tuple
+                        if ip_address not in resolved_ips: # 避免重复检查
+                            resolved_ips.add(ip_address)
+                            if is_private_ip(ip_address):
+                                logger.warning(f"URL主机名 '{parsed_url.hostname}' 解析到私有IP地址: {ip_address} for URL: {url}")
+                                return False
+                                
+                except socket.timeout:
+                    logger.warning(f"DNS解析超时 for hostname: {parsed_url.hostname}, URL: {url}")
+                    return False
+                except socket.gaierror as e:
+                    logger.warning(f"DNS解析失败 for hostname: {parsed_url.hostname}, Error: {e} for URL: {url}")
+                    return False # DNS解析失败视为不安全
+                finally:
+                    socket.setdefaulttimeout(original_timeout) # 恢复默认的 socket 超时设置
+                
+                if not resolved_ips:
+                    logger.warning(f"URL主机名 '{parsed_url.hostname}' 无法解析到任何IP地址 for URL: {url}")
+                    return False
+
         except Exception as e:
-            logger.warning(f"URL主机名IP解析或检查失败: {parsed_url.hostname}, Error: {e} for {url}")
-            # DNS解析失败也视为不安全，或者根据情况处理
+            logger.error(f"IP地址检查时发生意外错误: {e}\n{traceback.format_exc()} for URL: {url}")
             return False
 
         return True
@@ -319,7 +338,7 @@ def is_safe_url(url):
         return False
 
 
-# ==================== 消息处理接口 (修改了图片处理部分) ====================
+# ==================== 消息处理接口 (已更新) ====================
 @app.route('/', methods=['POST'])
 def handle_message():
     from_user = ""
@@ -353,8 +372,10 @@ def handle_message():
             pic_url = pic_url_element.text
 
             # ========== SSRF 防范增强 START ==========
+            # 对 PicUrl 进行安全检查
             if not is_safe_url(pic_url):
-                logger.warning(f"检测到不安全的图片URL，拒绝处理: {pic_url} for user: {from_user}")
+                # 日志中仅记录 URL 头部，避免敏感信息泄露
+                logger.warning(f"检测到不安全的图片URL，拒绝处理: {pic_url[:100]}... for user: {from_user}")
                 # 记录到 Redis，让用户查询时能得到反馈
                 redis_client.set(f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}", 
                                   f"{int(time.time())}|ERROR:{UNSAFE_URL_REPLY}", 
@@ -362,7 +383,7 @@ def handle_message():
                 return build_reply(from_user, to_user, UNSAFE_URL_REPLY)
             # ========== SSRF 防范增强 END ==========
 
-            logger.info(f"接收到图片消息, URL: {pic_url[:100]}...")
+            logger.info(f"接收到图片消息, URL 头部: {pic_url[:50]}...") # 脱敏日志
             
             reply_xml_str = f"""<xml>
                 <ToUserName><![CDATA[{from_user}]]></ToUserName>
@@ -394,25 +415,24 @@ def handle_message():
         </xml>"""
         return make_response(error_xml_str, 500, {'Content-Type': 'application/xml'})
 
-# ... (async_process_image, query_image_result, process_text_message, generate_with_retry, 
-#      build_reply, clean_content, text_to_image, upload_image_to_wechat, log_request 保持不变) ...
-
+# ==================== 后台图片处理及辅助函数 (已更新日志) ====================
 def async_process_image(pic_url, from_user, to_user):
     try:
-        logger.info(f"后台线程开始处理图片: {pic_url} for user: {from_user}")
+        logger.info(f"后台线程开始处理图片 (URL 头部): {pic_url[:50]}... for user: {from_user}") # 脱敏日志
         start_overall_time = time.time()
         start_download_time = time.time()
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36'}
         try:
-            # 注意：这里的 requests.get 仍然可能被重定向到不安全的地址
-            # requests 库默认会跟随重定向。更严格的 SSRF 防范会禁用重定向 (allow_redirects=False)
-            # 或者在跟随重定向后再次校验最终的URL和IP
+            # requests 库默认会跟随重定向 (allow_redirects=True)。
+            # 对于微信 PicUrl，通常认为其重定向是受控且安全的。
+            # 如需更严格防御重定向到内部IP，可设置 allow_redirects=False 
+            # 并手动检查 Location 头并再次进行 is_safe_url 检查。
             image_resp = requests.get(pic_url, timeout=5, headers=headers, allow_redirects=True) 
             image_resp.raise_for_status()
             image_data = image_resp.content
             logger.info(f"后台图片下载完成，耗时: {time.time()-start_download_time:.2f}秒，大小: {len(image_data)/1024:.2f}KB")
         except requests.exceptions.RequestException as e:
-            logger.error(f"后台图片下载失败 for user {from_user}: {e}\n{traceback.format_exc()}")
+            logger.error(f"后台图片下载失败 for user {from_user} (URL 头部: {pic_url[:50]}...): {e}\n{traceback.format_exc()}") # 脱敏日志
             redis_client.set(f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}", f"{int(time.time())}|ERROR:{IMAGE_DOWNLOAD_FAILED_REPLY}", ex=AI_RESULT_EXPIRATION_SECONDS)
             return
 
