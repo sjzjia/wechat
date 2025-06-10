@@ -137,8 +137,7 @@ def handle_message(xml_data):
         if msg_type == 'text' or msg_type == 'image':
             if msg_type == 'text':
                 logger.debug(f"收到文本消息: {content}")
-                prompt = content # 不再限制字数或额外提示
-#                prompt = content + "\n请用简洁的语言回复，不超过300字。"
+                prompt = content
                 try:
                     response = model.generate_content(prompt)
                     reply_content = response.text.strip() if response and response.text else "AI 没有返回任何内容。"
@@ -159,28 +158,43 @@ def handle_message(xml_data):
                     logger.error(f"处理图片失败: {e}\n{traceback.format_exc()}")
                     reply_content = "图片处理失败，请换一张试试。"
 
-            reply_content = clean_and_truncate(reply_content)
-            img_data = text_to_image(reply_content)
-            if img_data:
-                media_id = upload_image_to_wechat(img_data)
-                if media_id:
-                    # 返回图片消息XML
-                    return f"""<xml>
-                        <ToUserName><![CDATA[{from_user}]]></ToUserName>
-                        <FromUserName><![CDATA[{to_user}]]></FromUserName>
-                        <CreateTime>{int(time.time())}</CreateTime>
-                        <MsgType><![CDATA[image]]></MsgType>
-                        <Image><MediaId><![CDATA[{media_id}]]></MediaId></Image>
-                    </xml>"""
+            reply_content = reply_content.strip()
 
-            # 图片上传失败或文字转图片失败，退回文本回复
-            return f"""<xml>
-                <ToUserName><![CDATA[{from_user}]]></ToUserName>
-                <FromUserName><![CDATA[{to_user}]]></FromUserName>
-                <CreateTime>{int(time.time())}</CreateTime>
-                <MsgType><![CDATA[text]]></MsgType>
-                <Content><![CDATA[{escape(reply_content)}]]></Content>
-            </xml>"""
+            # 超过 2000 字节转图片回复
+            if len(reply_content.encode('utf-8')) > 2000:
+                img_data = text_to_image(reply_content)
+                if img_data:
+                    media_id = upload_image_to_wechat(img_data)
+                    if media_id:
+                        return f"""<xml>
+                            <ToUserName><![CDATA[{from_user}]]></ToUserName>
+                            <FromUserName><![CDATA[{to_user}]]></FromUserName>
+                            <CreateTime>{int(time.time())}</CreateTime>
+                            <MsgType><![CDATA[image]]></MsgType>
+                            <Image><MediaId><![CDATA[{media_id}]]></MediaId></Image>
+                        </xml>"""
+
+                # 图片生成或上传失败，退回文本回复并裁剪
+                truncated_content = clean_and_truncate(reply_content, max_bytes=2000)
+                truncated_content = escape(truncated_content)
+                return f"""<xml>
+                    <ToUserName><![CDATA[{from_user}]]></ToUserName>
+                    <FromUserName><![CDATA[{to_user}]]></FromUserName>
+                    <CreateTime>{int(time.time())}</CreateTime>
+                    <MsgType><![CDATA[text]]></MsgType>
+                    <Content><![CDATA[{truncated_content}]]></Content>
+                </xml>"""
+
+            else:
+                # 不超过限制，直接文本回复
+                reply_content = escape(reply_content)
+                return f"""<xml>
+                    <ToUserName><![CDATA[{from_user}]]></ToUserName>
+                    <FromUserName><![CDATA[{to_user}]]></FromUserName>
+                    <CreateTime>{int(time.time())}</CreateTime>
+                    <MsgType><![CDATA[text]]></MsgType>
+                    <Content><![CDATA[{reply_content}]]></Content>
+                </xml>"""
 
         else:
             return f"""<xml>
@@ -217,13 +231,11 @@ def wechat():
         if check_signature(signature, timestamp, nonce):
             return echostr
         else:
-            logger.warning(f"微信验证失败，signature={signature} timestamp={timestamp} nonce={nonce}")
-            return '验证失败'
+            return "Invalid signature"
+
     elif request.method == 'POST':
-        if request.content_type != 'text/xml':
-            logger.warning(f"不支持的 Content-Type: {request.content_type}")
-            return "不支持的 Content-Type", 400
         xml_data = request.data
+        logger.debug(f"收到请求数据: {xml_data}")
         reply_xml = handle_message(xml_data)
         return send_reply(reply_xml)
 
