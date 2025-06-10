@@ -13,7 +13,8 @@ import traceback
 import re
 from datetime import datetime
 import textwrap
-import threading # 引入 threading 模块
+import threading
+import redis # 引入 redis 库
 
 app = Flask(__name__)
 
@@ -54,7 +55,9 @@ REQUIRED_ENV_VARS = {
     'WECHAT_TOKEN': '微信Token',
     'GEMINI_API_KEY': 'Gemini API密钥',
     'WECHAT_APPID': '微信APPID',
-    'WECHAT_APPSECRET': '微信APPSECRET'
+    'WECHAT_APPSECRET': '微信APPSECRET',
+    'REDIS_HOST': 'Redis主机地址', # 新增 Redis 配置
+    'REDIS_PORT': 'Redis端口'     # 新增 Redis 配置
 }
 
 missing_vars = [name for name in REQUIRED_ENV_VARS if not os.environ.get(name)]
@@ -82,14 +85,38 @@ except Exception as e:
     logger.critical(f"Gemini 初始化失败: {str(e)}")
     raise RuntimeError("Gemini AI 模型初始化失败，请检查API密钥和网络连接。")
 
+# ==================== Redis 配置和连接 ====================
+REDIS_HOST = os.environ.get('REDIS_HOST', 'localhost')
+REDIS_PORT = int(os.environ.get('REDIS_PORT', 6379))
+REDIS_DB = int(os.environ.get('REDIS_DB', 0))
+REDIS_PASSWORD = os.environ.get('REDIS_PASSWORD') # 如果有密码
+
+try:
+    redis_client = redis.StrictRedis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        db=REDIS_DB,
+        password=REDIS_PASSWORD,
+        decode_responses=True, # 自动解码 Redis 返回的字节为字符串
+        socket_connect_timeout=5 # 连接超时
+    )
+    # 尝试连接 Redis
+    redis_client.ping()
+    logger.info(f"成功连接到 Redis 服务器: {REDIS_HOST}:{REDIS_PORT}")
+except redis.exceptions.ConnectionError as e:
+    logger.critical(f"无法连接到 Redis 服务器: {e}")
+    raise RuntimeError(f"无法连接到 Redis 服务器: {e}")
+except Exception as e:
+    logger.critical(f"Redis 初始化失败: {e}")
+    raise RuntimeError(f"Redis 初始化失败: {e}")
+
+# Redis 键的前缀，用于区分不同类型的数据
+REDIS_KEY_PREFIX = "wechat_ai_result:"
+# AI 结果在 Redis 中的过期时间（秒），例如 24 小时
+AI_RESULT_EXPIRATION_SECONDS = 24 * 3600 
+
 # ==================== 核心功能 ====================
 access_token_cache = {"token": None, "expires_at": 0}
-
-# 新增：用于存储用户AI处理结果的字典
-# 键：FromUserName (用户OpenID)
-# 值：AI处理结果列表，每个结果是一个字典，包含'timestamp'和'content'
-user_ai_results = {} 
-# 可以设置一个清理机制，例如定期移除旧的结果，防止内存无限增长
 
 def get_access_token():
     """
@@ -230,11 +257,9 @@ def handle_message():
             content = xml.find('Content').text
             logger.info(f"接收到文本消息: {content[:100]}...")
             
-            # ====== 新增：处理用户查询图片结果的文本消息 ======
-            # 判断用户是否发送了“查询图片结果”指令
+            # 处理用户查询图片结果的文本消息
             if content.strip() == "查询图片结果":
                 return query_image_result(from_user, to_user)
-            # ============================================
             
             # 如果不是查询指令，则作为普通文本消息处理
             ai_response_content = process_text_message(content)
@@ -250,7 +275,7 @@ def handle_message():
                 <FromUserName><![CDATA[{to_user}]]></FromUserName>
                 <CreateTime>{int(time.time())}</CreateTime>
                 <MsgType><![CDATA[text]]></MsgType>
-                <Content><![CDATA[图片已收到，AI正在努力识别中，请耐心等待10-20秒后发送“查询图片结果”来获取。]]></Content>
+                <Content><![CDATA[图片已收到，AI正在努力识别中，请稍候...请稍后发送“查询图片结果”来获取。]]></Content>
             </xml>"""
             
             # 在一个新线程中异步调用图片处理逻辑
@@ -282,7 +307,7 @@ def handle_message():
 def async_process_image(pic_url, from_user, to_user):
     """
     在后台线程中异步处理图片消息。
-    处理完成后将结果存储，但不发送给用户。
+    处理完成后将结果存储到 Redis，但不发送给用户。
     """
     try:
         logger.info(f"后台线程开始处理图片: {pic_url} for user: {from_user}")
@@ -309,21 +334,14 @@ def async_process_image(pic_url, from_user, to_user):
         
         logger.info(f"后台AI处理图片完成，总耗时: {time.time()-start_overall_time:.2f}秒。回复内容长度: {len(ai_response_content.encode('utf-8'))}字节")
 
-        # ====== 新增：将AI结果存储到内存字典 ======
-        # 为了线程安全，我们使用锁来保护 user_ai_results 的写入
-        # 但对于简单的内存字典，直接写入通常问题不大，除非并发极高
-        # 如果追求严格的线程安全，可以引入 threading.Lock
-        if from_user not in user_ai_results:
-            user_ai_results[from_user] = []
-        
-        # 只存储最近的几条结果，防止内存溢出
-        user_ai_results[from_user].append({
-            'timestamp': int(time.time()),
-            'content': ai_response_content
-        })
-        # 保持最多存储 5 条最近的结果，可以根据需求调整
-        user_ai_results[from_user] = user_ai_results[from_user][-5:]
-        logger.info(f"AI结果已为用户 {from_user} 存储。")
+        # ====== 新增：将AI结果存储到 Redis ======
+        redis_key = f"{REDIS_KEY_PREFIX}{from_user}"
+        # 将结果存储为字符串，包含时间戳和内容
+        # 如果需要存储多条，可以使用 Redis 的 List 或 Hash
+        # 这里为了简化，只存储最新的结果
+        value = f"{int(time.time())}|{ai_response_content}"
+        redis_client.set(redis_key, value, ex=AI_RESULT_EXPIRATION_SECONDS)
+        logger.info(f"AI结果已为用户 {from_user} 存储到 Redis (key: {redis_key})，有效期 {AI_RESULT_EXPIRATION_SECONDS} 秒。")
         # ==========================================
         
     except Exception as e:
@@ -332,17 +350,24 @@ def async_process_image(pic_url, from_user, to_user):
 
 def query_image_result(from_user, to_user):
     """
-    处理用户查询图片结果的请求。
+    处理用户查询图片结果的请求，从 Redis 中获取结果。
     """
-    if from_user in user_ai_results and user_ai_results[from_user]:
-        # 获取最近的一个结果
-        latest_result = user_ai_results[from_user][-1]
-        # 格式化时间戳以便用户理解
-        content_to_reply = f"这是您最近一次图片识别的结果（{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(latest_result['timestamp']))}）:\n\n{latest_result['content']}"
-        logger.info(f"为用户 {from_user} 返回存储的图片识别结果。")
+    redis_key = f"{REDIS_KEY_PREFIX}{from_user}"
+    stored_value = redis_client.get(redis_key) # 获取存储的值
+
+    if stored_value:
+        # 解析存储的值
+        try:
+            timestamp_str, content = stored_value.split('|', 1)
+            timestamp = int(timestamp_str)
+            content_to_reply = f"这是您最近一次图片识别的结果（{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))}）:\n\n{content}"
+            logger.info(f"为用户 {from_user} 返回存储在 Redis 中的图片识别结果。")
+        except ValueError: # 解析失败
+            content_to_reply = "抱歉，无法解析存储的图片识别结果，请重试。"
+            logger.error(f"解析 Redis 存储值失败 for user {from_user}: {stored_value}")
     else:
-        content_to_reply = "请再稍等几秒钟继续查询，AI正在努力识别中"
-        logger.info(f"用户 {from_user} 查询图片结果，但无可用结果。")
+        content_to_reply = "您目前没有待查询的图片识别结果，或者结果已过期。请先发送一张图片让我识别。"
+        logger.info(f"用户 {from_user} 查询图片结果，Redis 中无可用结果。")
     
     # 使用 build_reply 函数来统一处理文本或图片回复
     return build_reply(from_user, to_user, content_to_reply)
