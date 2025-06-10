@@ -10,6 +10,7 @@ import os
 from PIL import Image
 import io
 import traceback
+import re
 
 app = Flask(__name__)
 
@@ -33,10 +34,20 @@ def check_signature(signature, timestamp, nonce):
     logger.debug(f"check_signature: {signature} == {tmp_str}")
     return tmp_str == signature
 
-def truncate_message(content, max_length=2000):
-    while len(content.encode('utf-8')) > max_length:
-        content = content[:-1]
-    return content
+def clean_and_truncate(content, max_bytes=2000):
+    # 去除常见 Markdown 标记符号，避免影响微信显示
+    content = re.sub(r'(\*\*|__|\*|_|`|~~)', '', content)
+    # 合并多余空行，回复更紧凑
+    content = re.sub(r'\n\s*\n+', '\n', content).strip()
+
+    # 字节截断，防止超长
+    encoded = content.encode('utf-8')
+    if len(encoded) <= max_bytes:
+        return content
+
+    truncated = encoded[:max_bytes]
+    # 避免截断导致 utf-8 编码错误，重新解码时忽略错误
+    return truncated.decode('utf-8', errors='ignore')
 
 def handle_message(xml_data):
     from_user = to_user = ""
@@ -83,7 +94,8 @@ def handle_message(xml_data):
         else:
             reply_content = "暂不支持该类型的消息，请发送文字或图片。"
 
-        reply_content = truncate_message(reply_content, 2048)
+        # 清理内容并截断长度
+        reply_content = clean_and_truncate(reply_content, max_bytes=2000)
         reply_content = escape(reply_content)
 
         reply_xml = f"""
