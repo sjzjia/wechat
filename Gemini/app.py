@@ -14,9 +14,32 @@ import re
 from datetime import datetime
 import textwrap
 import threading
-import redis # 引入 redis 库
+import redis
 
 app = Flask(__name__)
+
+# ==================== 常量定义 ====================
+# 用户查询指令
+QUERY_IMAGE_RESULT_COMMAND = "查询图片结果"
+
+# 用户提示消息
+INITIAL_IMAGE_PROCESSING_MESSAGE = "图片已收到，AI正在努力识别中，请耐心等待10-20秒后发送“查询图片结果”来获取。[抱拳]"
+UNSUPPORTED_MESSAGE_TYPE_REPLY = "暂不支持该类型的消息，请发送文本或图片。"
+SERVER_INTERNAL_ERROR_REPLY = "服务器内部错误，请稍后重试。"
+AI_SERVICE_UNAVAILABLE_REPLY = "AI 服务暂时不可用，请稍后再试。"
+IMAGE_DOWNLOAD_FAILED_REPLY = "抱歉，图片下载失败，请检查网络或图片链接是否有效，然后重试。"
+IMAGE_PROCESSING_FAILED_REPLY = "抱歉，图片处理失败，请重试。"
+IMAGE_QUERY_NO_RESULT_REPLY = "AI正在努力识别中，或您目前没有待查询的图片识别结果，或者结果已过期。请先发送一张图片让我识别。[抱拳]"
+IMAGE_QUERY_PARSE_ERROR_REPLY = "抱歉，无法解析存储的图片识别结果，请重试或重新发送图片。"
+AI_REPLY_TOO_LONG_IMAGE_FAIL_PREFIX = "AI回复超长，转图片失败。以下为截断内容：\n"
+AI_REPLY_EXCEPTION_REPLY = "AI回复异常，请稍后重试。"
+ACCESS_TOKEN_FETCH_FAILED_REPLY = "抱歉，无法获取微信服务凭证，请联系管理员。"
+
+# Redis 键的前缀和过期时间
+REDIS_USER_AI_RESULT_PREFIX = "wechat_ai_result:" # 用户图片AI结果前缀
+REDIS_TEXT_CACHE_PREFIX = "wechat_text_cache:"    # 文本问答缓存前缀
+AI_RESULT_EXPIRATION_SECONDS = 24 * 3600 # 用户图片AI结果保存 24 小时
+TEXT_CACHE_EXPIRATION_SECONDS = 6 * 3600 # 文本问答缓存保存 6 小时
 
 # ==================== 初始化配置 ====================
 def setup_logging():
@@ -57,7 +80,7 @@ REQUIRED_ENV_VARS = {
     'WECHAT_APPID': '微信APPID',
     'WECHAT_APPSECRET': '微信APPSECRET',
     'REDIS_HOST': 'Redis主机地址', 
-    'REDIS_PORT': 'Redis端口'     
+    'REDIS_PORT': 'Redis端口'      
 }
 
 missing_vars = [name for name in REQUIRED_ENV_VARS if not os.environ.get(name)]
@@ -71,7 +94,7 @@ WECHAT_TOKEN = os.environ['WECHAT_TOKEN']
 GEMINI_API_KEY = os.environ['GEMINI_API_KEY']
 APPID = os.environ['WECHAT_APPID']
 APPSECRET = os.environ['WECHAT_APPSECRET']
-FONT_PATH = "SourceHanSansSC-Regular.otf" 
+FONT_PATH = "SourceHanSansSC-Regular.otf"  
 
 if not os.path.exists(FONT_PATH):
     logger.critical(f"字体文件不存在: {FONT_PATH}，请确保已下载并放置在应用根目录。")
@@ -110,16 +133,9 @@ except Exception as e:
     logger.critical(f"Redis 初始化失败: {e}")
     raise RuntimeError(f"Redis 初始化失败: {e}")
 
-# Redis 键的前缀，用于区分不同类型的数据
-REDIS_USER_AI_RESULT_PREFIX = "wechat_ai_result:" # 用户图片AI结果前缀
-REDIS_TEXT_CACHE_PREFIX = "wechat_text_cache:"    # 文本问答缓存前缀
-
-# AI 结果在 Redis 中的过期时间（秒）
-AI_RESULT_EXPIRATION_SECONDS = 24 * 3600 # 用户图片AI结果保存 24 小时
-TEXT_CACHE_EXPIRATION_SECONDS = 6 * 3600 # 文本问答缓存保存 6 小时
-
-# ==================== 核心功能 ====================
+# ==================== 核心功能 - Access Token ====================
 access_token_cache = {"token": None, "expires_at": 0}
+token_lock = threading.Lock() # 新增：用于保护 access_token_cache 的并发访问
 
 def get_access_token():
     """
@@ -127,11 +143,14 @@ def get_access_token():
     access_token 有效期为2小时，我们提前1分钟刷新。
     """
     now = int(time.time())
-    if access_token_cache["token"] and access_token_cache["expires_at"] > now + 60:
-        logger.debug("使用缓存的access_token")
-        return access_token_cache["token"]
     
+    with token_lock: # 读取缓存时加锁
+        if access_token_cache["token"] and access_token_cache["expires_at"] > now + 60:
+            logger.debug("使用缓存的access_token")
+            return access_token_cache["token"]
+            
     logger.info("正在获取新的access_token...")
+    start_time = time.time() # 记录获取 token 的开始时间
     try:
         url = f"https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid={APPID}&secret={APPSECRET}"
         resp = requests.get(url, timeout=5)
@@ -139,10 +158,12 @@ def get_access_token():
         data = resp.json()
         
         if 'access_token' in data:
-            access_token_cache["token"] = data['access_token']
-            expires_in = data.get('expires_in', 7200)
-            access_token_cache["expires_at"] = now + expires_in
-            logger.info(f"获取access_token成功，有效期: {expires_in}秒，下次刷新时间: {datetime.fromtimestamp(access_token_cache['expires_at']-60)}")
+            with token_lock: # 写入缓存时加锁
+                access_token_cache["token"] = data['access_token']
+                expires_in = data.get('expires_in', 7200)
+                access_token_cache["expires_at"] = now + expires_in
+            duration = time.time() - start_time
+            logger.info(f"获取access_token成功，耗时: {duration:.2f}秒，有效期: {expires_in}秒，下次刷新时间: {datetime.fromtimestamp(access_token_cache['expires_at']-60)}")
             return data['access_token']
         
         logger.error(f"获取access_token失败，微信API返回错误: {data}")
@@ -216,7 +237,7 @@ def check_signature(signature, timestamp, nonce):
         try:
             timestamp_int = int(timestamp)
             time_diff = abs(int(time.time()) - timestamp_int)
-            if time_diff > 300:
+            if time_diff > 300: # 5分钟有效期
                 logger.warning(f"签名验证失败: 时间戳过期 (当前时间戳差异: {time_diff}秒)。")
                 return False
         except ValueError:
@@ -261,15 +282,20 @@ def handle_message():
             logger.info(f"接收到文本消息: {content[:100]}...")
             
             # 处理用户查询图片结果的文本消息
-            if content.strip() == "查询图片结果":
+            if content.strip() == QUERY_IMAGE_RESULT_COMMAND:
                 return query_image_result(from_user, to_user)
             
             # 如果不是查询指令，则作为普通文本消息处理
             ai_response_content = process_text_message(content)
             return build_reply(from_user, to_user, ai_response_content)
-        
+            
         elif msg_type == 'image':
-            pic_url = xml.find('PicUrl').text
+            pic_url_element = xml.find('PicUrl')
+            if pic_url_element is None or not pic_url_element.text:
+                logger.error(f"图片消息中缺少 PicUrl 字段或为空 for user: {from_user}")
+                return build_reply(from_user, to_user, "抱歉，收到的图片消息格式不完整。")
+            pic_url = pic_url_element.text
+
             logger.info(f"接收到图片消息, URL: {pic_url[:100]}...")
             
             # 立即返回一个“处理中”的文本消息给微信
@@ -278,11 +304,11 @@ def handle_message():
                 <FromUserName><![CDATA[{to_user}]]></FromUserName>
                 <CreateTime>{int(time.time())}</CreateTime>
                 <MsgType><![CDATA[text]]></MsgType>
-                <Content><![CDATA[图片已收到，AI正在努力识别中，请耐心等待10-20秒后发送“查询图片结果”来获取。[抱拳]]]></Content>
+                <Content><![CDATA[{INITIAL_IMAGE_PROCESSING_MESSAGE}]]></Content>
             </xml>"""
             
             # 在一个新线程中异步调用图片处理逻辑
-            # 注意：这里需要将 from_user 传递给异步函数，以便存储结果
+            # to_user 仍传递，尽管 async_process_image 不直接回复，但可用于日志等
             threading.Thread(target=async_process_image, args=(pic_url, from_user, to_user)).start()
             
             # 立即返回响应，避免微信超时
@@ -290,7 +316,7 @@ def handle_message():
             
         else:
             logger.warning(f"接收到不支持的消息类型: {msg_type}")
-            ai_response_content = "暂不支持该类型的消息，请发送文本或图片。"
+            ai_response_content = UNSUPPORTED_MESSAGE_TYPE_REPLY
             return build_reply(from_user, to_user, ai_response_content)
 
     except Exception as e:
@@ -303,14 +329,14 @@ def handle_message():
             <FromUserName><![CDATA[{safe_to_user}]]></FromUserName>
             <CreateTime>{int(time.time())}</CreateTime>
             <MsgType><![CDATA[text]]></MsgType>
-            <Content><![CDATA[服务器内部错误，请稍后重试。]]></Content>
+            <Content><![CDATA[{SERVER_INTERNAL_ERROR_REPLY}]]></Content>
         </xml>"""
         return make_response(error_xml_str, 500, {'Content-Type': 'application/xml'})
 
 def async_process_image(pic_url, from_user, to_user):
     """
     在后台线程中异步处理图片消息。
-    处理完成后将结果存储到 Redis，但不发送给用户。
+    处理完成后将结果存储到 Redis，不自动推送。
     """
     try:
         logger.info(f"后台线程开始处理图片: {pic_url} for user: {from_user}")
@@ -320,10 +346,16 @@ def async_process_image(pic_url, from_user, to_user):
         # 1. 下载图片
         start_download_time = time.time()
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36'}
-        image_resp = requests.get(pic_url, timeout=5, headers=headers)
-        image_resp.raise_for_status()
-        image_data = image_resp.content
-        logger.info(f"后台图片下载完成，耗时: {time.time()-start_download_time:.2f}秒，大小: {len(image_data)/1024:.2f}KB")
+        try:
+            image_resp = requests.get(pic_url, timeout=5, headers=headers)
+            image_resp.raise_for_status() # 检查 HTTP 状态码
+            image_data = image_resp.content
+            logger.info(f"后台图片下载完成，耗时: {time.time()-start_download_time:.2f}秒，大小: {len(image_data)/1024:.2f}KB")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"后台图片下载失败 for user {from_user}: {e}\n{traceback.format_exc()}")
+            # 存储错误到Redis，供用户查询
+            redis_client.set(f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}", f"{int(time.time())}|ERROR:{IMAGE_DOWNLOAD_FAILED_REPLY}", ex=AI_RESULT_EXPIRATION_SECONDS)
+            return # 提前返回
 
         # 2. 图像预处理
         img = Image.open(io.BytesIO(image_data))
@@ -332,16 +364,13 @@ def async_process_image(pic_url, from_user, to_user):
 
         # 3. 调用 Gemini
         prompt = "请用中文详细描述这张图片的内容，并尽可能分析它的含义。"
-        logger.info("后台调用 Gemini 处理图片...")
+        logger.info(f"后台调用 Gemini 处理图片 for user: {from_user}...")
         ai_response_content = generate_with_retry(prompt, img, is_image_context=True)
         
-        logger.info(f"后台AI处理图片完成，总耗时: {time.time()-start_overall_time:.2f}秒。回复内容长度: {len(ai_response_content.encode('utf-8'))}字节")
+        logger.info(f"后台AI处理图片完成 for user: {from_user}，总耗时: {time.time()-start_overall_time:.2f}秒。回复内容长度: {len(ai_response_content.encode('utf-8'))}字节")
 
-        # ====== 新增：将AI结果存储到 Redis ======
+        # 将AI结果存储到 Redis
         redis_key = f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}"
-        # 将结果存储为字符串，包含时间戳和内容
-        # 如果需要存储多条，可以使用 Redis 的 List 或 Hash
-        # 这里为了简化，只存储最新的结果
         value = f"{int(time.time())}|{ai_response_content}"
         
         try:
@@ -349,12 +378,15 @@ def async_process_image(pic_url, from_user, to_user):
             logger.info(f"AI图片结果已为用户 {from_user} 存储到 Redis (key: {redis_key})，有效期 {AI_RESULT_EXPIRATION_SECONDS} 秒。")
         except redis.exceptions.ConnectionError as e:
             logger.error(f"无法将 AI 图片结果存储到 Redis (连接错误): {e}")
+            # 这种情况无法直接告知用户，但日志会记录
         except Exception as e:
             logger.error(f"存储 AI 图片结果到 Redis 时发生未知错误: {e}")
-        # ==========================================
-        
+            # 这种情况无法直接告知用户，但日志会记录
+            
     except Exception as e:
-        logger.error(f"后台图片处理线程发生异常: {e}\n{traceback.format_exc()}")
+        logger.error(f"后台图片处理线程发生异常 for user {from_user}: {e}\n{traceback.format_exc()}")
+        # 即使是其他未知错误，也尝试在 Redis 中留下标记
+        redis_client.set(f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}", f"{int(time.time())}|ERROR:{IMAGE_PROCESSING_FAILED_REPLY}", ex=AI_RESULT_EXPIRATION_SECONDS)
 
 
 def query_image_result(from_user, to_user):
@@ -373,19 +405,26 @@ def query_image_result(from_user, to_user):
         return build_reply(from_user, to_user, "抱歉，查询结果时发生错误，请稍后再试。")
 
     if stored_value:
-        # 解析存储的值
         try:
             timestamp_str, content = stored_value.split('|', 1)
             timestamp = int(timestamp_str)
-            content_to_reply = f"这是您最近一次图片识别的结果（{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))}）:\n\n{content}"
-            logger.info(f"为用户 {from_user} 返回存储在 Redis 中的图片识别结果。")
+            
+            if content.startswith("ERROR:"): # 检查是否为错误标记
+                # 提取实际的错误信息并回复用户
+                error_message = content[6:] 
+                content_to_reply = f"抱歉，您的图片处理失败了（{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))}）。\n原因：{error_message} 请尝试重新发送图片。"
+                logger.warning(f"为用户 {from_user} 返回存储在 Redis 中的图片处理失败信息。")
+            else:
+                content_to_reply = f"这是您最近一次图片识别的结果（{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))}）:\n\n{content}"
+                logger.info(f"为用户 {from_user} 返回存储在 Redis 中的图片识别结果。")
+            
         except ValueError: # 解析失败
-            content_to_reply = "抱歉，无法解析存储的图片识别结果，请重试。"
+            content_to_reply = IMAGE_QUERY_PARSE_ERROR_REPLY
             logger.error(f"解析 Redis 存储值失败 for user {from_user}: {stored_value}")
     else:
-        content_to_reply = "AI正在努力识别中，或您目前没有待查询的图片识别结果，或者结果已过期。请先发送一张图片让我识别。[抱拳]"
+        content_to_reply = IMAGE_QUERY_NO_RESULT_REPLY
         logger.info(f"用户 {from_user} 查询图片结果，Redis 中无可用结果。")
-    
+        
     # 使用 build_reply 函数来统一处理文本或图片回复
     return build_reply(from_user, to_user, content_to_reply)
 
@@ -393,7 +432,7 @@ def process_text_message(content):
     """通过 Gemini 处理文本消息并返回 AI 生成的文本"""
     logger.info("调用 Gemini 处理文本...")
     
-    # ====== 新增：文本问答缓存逻辑 ======
+    # 文本问答缓存逻辑
     normalized_content = content.strip().lower() # 规范化内容作为缓存键
     cache_key = f"{REDIS_TEXT_CACHE_PREFIX}{hashlib.md5(normalized_content.encode('utf-8')).hexdigest()}"
     
@@ -425,7 +464,7 @@ def process_text_message(content):
         return ai_response_content
     except Exception as e:
         logger.error(f"处理文本消息时 AI 调用失败: {e}")
-        return "AI处理文本失败，请稍后再试。"
+        return AI_SERVICE_UNAVAILABLE_REPLY
 
 def generate_with_retry(prompt, image=None, max_retries=3, is_image_context=False):
     """
@@ -445,7 +484,7 @@ def generate_with_retry(prompt, image=None, max_retries=3, is_image_context=Fals
         temperature=0.7,
         top_p=0.9,
         top_k=40,
-        max_output_tokens=1024 
+        max_output_tokens=1024
     )
     
     start_overall_ai_time = time.time()
@@ -482,7 +521,7 @@ def generate_with_retry(prompt, image=None, max_retries=3, is_image_context=Fals
             time.sleep(wait_time)
             
     logger.error("AI 生成失败，已达到最大重试次数。")
-    return "AI 服务暂时不可用，请稍后再试。"
+    return AI_SERVICE_UNAVAILABLE_REPLY
 
 def build_reply(from_user, to_user, content):
     """
@@ -520,7 +559,7 @@ def build_reply(from_user, to_user, content):
                         <FromUserName><![CDATA[{to_user}]]></FromUserName>
                         <CreateTime>{int(time.time())}</CreateTime>
                         <MsgType><![CDATA[text]]></MsgType>
-                        <Content><![CDATA[AI回复超长，转图片失败。以下为截断内容：\n{escape(truncated_content)}]]></Content>
+                        <Content><![CDATA[{escape(AI_REPLY_TOO_LONG_IMAGE_FAIL_PREFIX + truncated_content)}]]></Content>
                     </xml>"""
             else:
                 logger.warning("文本转换为图片失败，回退到文本回复并截断。")
@@ -530,7 +569,7 @@ def build_reply(from_user, to_user, content):
                     <FromUserName><![CDATA[{to_user}]]></FromUserName>
                     <CreateTime>{int(time.time())}</CreateTime>
                     <MsgType><![CDATA[text]]></MsgType>
-                    <Content><![CDATA[AI回复超长，转图片失败。以下为截断内容：\n{escape(truncated_content)}]]></Content>
+                    <Content><![CDATA[{escape(AI_REPLY_TOO_LONG_IMAGE_FAIL_PREFIX + truncated_content)}]]></Content>
                 </xml>"""
         else:
             logger.info(f"内容在文本限制内({content_bytes}字节)，使用文本回复。")
@@ -543,7 +582,7 @@ def build_reply(from_user, to_user, content):
             </xml>"""
         
         return make_response(reply_xml_str, 200, {'Content-Type': 'application/xml'})
-    
+        
     except Exception as e:
         logger.error(f"构建回复时发生异常: {e}\n{traceback.format_exc()}")
         safe_from_user = from_user if 'from_user' in locals() and from_user else 'unknown_user'
@@ -553,7 +592,7 @@ def build_reply(from_user, to_user, content):
             <FromUserName><![CDATA[{safe_to_user}]]></FromUserName>
             <CreateTime>{int(time.time())}</CreateTime>
             <MsgType><![CDATA[text]]></MsgType>
-            <Content><![CDATA[AI回复异常，请稍后重试。]]></Content>
+            <Content><![CDATA[{AI_REPLY_EXCEPTION_REPLY}]]></Content>
         </xml>"""
         return make_response(error_xml_str, 500, {'Content-Type': 'application/xml'})
 
@@ -566,6 +605,7 @@ def clean_content(content, max_bytes=None):
     if not content:
         return ""
     
+    # 移除常见的 Markdown 格式符号
     content = re.sub(r'(\*\*|__|\*|_|`|~~|#+\s*|\[.*?\]\(.*?\))', '', content)
 
     processed_lines = []
@@ -577,6 +617,7 @@ def clean_content(content, max_bytes=None):
             processed_lines.append(stripped_line)
 
     content = '\n'.join(processed_lines)
+    # 合并连续的空行，最多保留一个空行
     content = re.sub(r'\n{2,}', '\n\n', content)
     content = content.strip()
 
@@ -584,7 +625,10 @@ def clean_content(content, max_bytes=None):
         encoded = content.encode('utf-8')
         if len(encoded) > max_bytes:
             logger.warning(f"内容因字节限制被截断: 原始 {len(encoded)} 字节，截断至 {max_bytes} 字节。")
-            return encoded[:max_bytes].decode('utf-8', errors='ignore')
+            # 确保截断在有效UTF-8字符边界
+            while len(encoded) > max_bytes:
+                encoded = encoded[:-1]
+            return encoded.decode('utf-8', errors='ignore') # 使用errors='ignore'处理不完整的字符
     return content
 
 def text_to_image(text, max_width=600, font_size=24):
@@ -598,17 +642,22 @@ def text_to_image(text, max_width=600, font_size=24):
         line_spacing = 10
         font = ImageFont.truetype(FONT_PATH, font_size)
         
+        # 计算每行可容纳的字符数（近似值）
+        # 使用中文字符的平均宽度进行估算
         avg_char_width = font.getlength('中') 
         chars_per_line = int((max_width - 2 * padding) / avg_char_width)
+        if chars_per_line <= 0: # 避免除零或负数
+            chars_per_line = 1 
 
         wrapped_lines = []
+        # 对每个段落进行换行处理，保持段落之间的空行
         for paragraph in text.split('\n'):
             if not paragraph.strip():
-                wrapped_lines.append('')
+                wrapped_lines.append('') # 保留空行
             else:
                 wrapped_lines.extend(textwrap.wrap(paragraph, width=chars_per_line, break_long_words=False, replace_whitespace=False))
         
-        if not wrapped_lines:
+        if not wrapped_lines: # 如果文本为空或仅包含空白字符
             wrapped_lines = [""]
 
         line_height = font_size + line_spacing
@@ -622,6 +671,7 @@ def text_to_image(text, max_width=600, font_size=24):
             draw.text((padding, y), line, font=font, fill=(0, 0, 0))
             y += line_height
         
+        # 添加水印
         watermark = "AI生成内容"
         watermark_font = ImageFont.truetype(FONT_PATH, int(font_size * 0.8))
         watermark_width = watermark_font.getlength(watermark)
