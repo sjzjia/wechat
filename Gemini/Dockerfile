@@ -14,4 +14,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 EXPOSE 80
 
 # 启动应用
-CMD ["python", "app.py"]
+CMD ["gunicorn", "-w", "3", "app:app", "-b", "0.0.0.0:80"]
