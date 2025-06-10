@@ -3,6 +3,7 @@ import time
 import requests
 from flask import Flask, request, make_response
 from xml.etree import ElementTree as ET
+from xml.sax.saxutils import escape
 import logging
 import google.generativeai as genai
 import os
@@ -36,18 +37,6 @@ def truncate_message(content, max_length=2000):
         content = content_bytes[:max_length].decode('utf-8', 'ignore')
     return content
 
-# 将内容分成多个部分 (这个函数现在不直接使用，但保留以备将来可能需要)
-def split_message(content, max_length=2000):
-    content_bytes = content.encode('utf-8')
-    parts = []
-    while len(content_bytes) > max_length:
-        part = content_bytes[:max_length].decode('utf-8', 'ignore')
-        parts.append(part)
-        content_bytes = content_bytes[max_length:]
-    if content_bytes:
-        parts.append(content_bytes.decode('utf-8', 'ignore'))
-    return parts
-
 # 处理用户消息
 def handle_message(xml_data):
     try:
@@ -61,90 +50,68 @@ def handle_message(xml_data):
         logger.debug(f"Received message from {from_user}: {content}, pic_url: {pic_url}")
 
         model = genai.GenerativeModel('gemini-2.0-flash')
+
         if msg_type == 'text':
-            response = model.generate_content(content)
+            if content.strip().lower() in ['help', '帮助', '菜单']:
+                reply_content = "欢迎使用 AI 智能助手！您可以发送文字让我回复，也可以发送图片让我分析内容。"
+            else:
+                response = model.generate_content(content)
+                reply_content = response.text.strip() if response and response.text else "AI 没有返回任何内容。"
+
         elif msg_type == 'image':
             try:
-                image_data = requests.get(pic_url, timeout=10).content #Added timeout
+                image_data = requests.get(pic_url, timeout=10).content
                 image = Image.open(io.BytesIO(image_data))
-                chinese_prompt = "请用中文回复。"
-                response = model.generate_content([chinese_prompt, image])
+                image.verify()  # 验证图片格式
+                image = Image.open(io.BytesIO(image_data))  # 重新打开用于模型输入
+
+                prompt = "请用中文详细描述这张图片的内容，并尽可能分析它的含义。"
+                response = model.generate_content([prompt, image])
+                reply_content = response.text.strip() if response and response.text else "AI 没有返回任何内容。"
+
             except requests.exceptions.RequestException as e:
                 logger.error(f"Error downloading image: {e}, pic_url: {pic_url}, traceback: {traceback.format_exc()}")
-                error_reply_xml = f"""
-                    <xml>
-                        <ToUserName><![CDATA[{from_user}]]></ToUserName>
-                        <FromUserName><![CDATA[{to_user}]]></FromUserName>
-                        <CreateTime>{int(time.time())}</CreateTime>
-                        <MsgType><![CDATA[text]]></MsgType>
-                        <Content><![CDATA[图片下载失败]]></Content>
-                    </xml>
-                    """
-                return error_reply_xml
+                reply_content = "图片下载失败，请稍后再试。"
             except Exception as e:
                 logger.error(f"Error processing image: {e}, pic_url: {pic_url}, traceback: {traceback.format_exc()}")
-                error_reply_xml = f"""
-                    <xml>
-                        <ToUserName><![CDATA[{from_user}]]></ToUserName>
-                        <FromUserName><![CDATA[{to_user}]]></FromUserName>
-                        <CreateTime>{int(time.time())}</CreateTime>
-                        <MsgType><![CDATA[text]]></MsgType>
-                        <Content><![CDATA[图片处理失败]]></Content>
-                    </xml>
-                    """
-                return error_reply_xml
+                reply_content = "图片格式不支持或处理失败，请换一张图片试试。"
 
-        if response and response.text:
-            reply_content = response.text.strip()
-            reply_content = truncate_message(reply_content, 2048) # 确保内容长度不超过限制
-            logger.debug(f"Gemini API response: {reply_content}")
-            reply_xml = f"""
-                <xml>
-                    <ToUserName><![CDATA[{from_user}]]></ToUserName>
-                    <FromUserName><![CDATA[{to_user}]]></FromUserName>
-                    <CreateTime>{int(time.time())}</CreateTime>
-                    <MsgType><![CDATA[text]]></MsgType>
-                    <Content><![CDATA[{reply_content}]]></Content>
-                </xml>
-                """
-            return reply_xml
         else:
-            logger.warning("Gemini API 返回空值或无效数据")
-            error_reply_xml = f"""
-                <xml>
-                    <ToUserName><![CDATA[{from_user}]]></ToUserName>
-                    <FromUserName><![CDATA[{to_user}]]></FromUserName>
-                    <CreateTime>{int(time.time())}</CreateTime>
-                    <MsgType><![CDATA[text]]></MsgType>
-                    <Content><![CDATA[Gemini API 返回空值或无效数据]]></Content>
-                </xml>
-                """
-            return error_reply_xml
+            reply_content = "暂不支持该类型的消息，请发送文字或图片。"
+
+        # 安全处理和截断
+        reply_content = truncate_message(reply_content, 2048)
+        reply_content = escape(reply_content)
+
+        reply_xml = f"""
+            <xml>
+                <ToUserName><![CDATA[{from_user}]]></ToUserName>
+                <FromUserName><![CDATA[{to_user}]]></FromUserName>
+                <CreateTime>{int(time.time())}</CreateTime>
+                <MsgType><![CDATA[text]]></MsgType>
+                <Content><![CDATA[{reply_content}]]></Content>
+            </xml>
+            """
+        return reply_xml
 
     except ET.ParseError as e:
         logger.error(f"XML parsing error: {e}, xml_data: {xml_data}, traceback: {traceback.format_exc()}")
-        error_reply_xml = f"""
-            <xml>
-                <ToUserName><![CDATA[{from_user}]]></ToUserName>
-                <FromUserName><![CDATA[{to_user}]]></FromUserName>
-                <CreateTime>{int(time.time())}</CreateTime>
-                <MsgType><![CDATA[text]]></MsgType>
-                <Content><![CDATA[XML 解析错误]]></Content>
-            </xml>
-            """
-        return error_reply_xml
+        return make_error_xml("XML 解析错误", from_user, to_user)
     except Exception as e:
         logger.error(f"Error while handling message: {e}, xml_data: {xml_data}, traceback: {traceback.format_exc()}")
-        error_reply_xml = f"""
-            <xml>
-                <ToUserName><![CDATA[{from_user}]]></ToUserName>
-                <FromUserName><![CDATA[{to_user}]]></FromUserName>
-                <CreateTime>{int(time.time())}</CreateTime>
-                <MsgType><![CDATA[text]]></MsgType>
-                <Content><![CDATA[抱歉，处理消息时发生了错误。]]></Content>
-            </xml>
-            """
-        return error_reply_xml
+        return make_error_xml("抱歉，处理消息时发生了错误。", from_user, to_user)
+
+def make_error_xml(content, from_user, to_user):
+    safe_content = escape(content)
+    return f"""
+        <xml>
+            <ToUserName><![CDATA[{from_user}]]></ToUserName>
+            <FromUserName><![CDATA[{to_user}]]></FromUserName>
+            <CreateTime>{int(time.time())}</CreateTime>
+            <MsgType><![CDATA[text]]></MsgType>
+            <Content><![CDATA[{safe_content}]]></Content>
+        </xml>
+        """
 
 # 发送微信回复消息
 def send_reply(reply_xml):
@@ -153,37 +120,31 @@ def send_reply(reply_xml):
     response.content_type = 'application/xml'
     return response
 
-
 # 微信服务器验证和消息处理
 @app.route('/', methods=['GET', 'POST'])
 def wechat():
     if request.method == 'GET':
-        signature = request.args.get('signature', '')
-        timestamp = request.args.get('timestamp', '')
-        nonce = request.args.get('nonce', '')
-        echostr = request.args.get('echostr', '')
+        params = request.args.to_dict()
+        signature = params.get('signature', '')
+        timestamp = params.get('timestamp', '')
+        nonce = params.get('nonce', '')
+        echostr = params.get('echostr', '')
         logger.debug(f"GET request: signature={signature}, timestamp={timestamp}, nonce={nonce}, echostr={echostr}")
         if check_signature(signature, timestamp, nonce):
             return echostr
         else:
             return '验证失败'
+
     elif request.method == 'POST':
+        if request.content_type != 'text/xml':
+            logger.warning(f"Unexpected content type: {request.content_type}")
+            return "不支持的 Content-Type", 400
+
         xml_data = request.data
         logger.debug(f"POST request data: {xml_data}")
-        reply_xml = handle_message(xml_data) # 直接获取单个 XML 字符串
-
-        if reply_xml:
-            logger.debug(f"Reply to send: {reply_xml}")
-            response = send_reply(reply_xml)
-            logger.debug("Reply sent successfully.")
-            return response
-        else:
-            logger.warning("No reply generated.")
-            return "没有生成回复。", 200
+        reply_xml = handle_message(xml_data)
+        return send_reply(reply_xml)
 
 # 启动 Flask 应用（HTTP）
-if __name__ == '__main__':
-    try:
-        app.run(host='0.0.0.0', port=80)
-    finally:
-        pass # No need to shutdown the executor and queue.
+# if __name__ == '__main__':
+#    app.run(host='0.0.0.0', port=80)
