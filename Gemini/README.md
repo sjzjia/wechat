@@ -21,5 +21,6 @@ docker run -d \
 
 下面是个使用图片询问2025年高考数学题目的实例，如果发送过去是图片或者回复的数字超过 2000 字节的都需要这种方式获取结果，因为公众号限制不能大于2048字节
 
-<img width="809" alt="image" src="https://github.com/user-attachments/assets/69a91d4e-e046-4a69-8de6-87212a57c7f2" />
+<img width="805" alt="image" src="https://github.com/user-attachments/assets/b77857a6-f0a3-457e-8900-bd5141e045a9" />
+
 
