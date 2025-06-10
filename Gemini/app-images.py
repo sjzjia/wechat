@@ -56,8 +56,8 @@ REQUIRED_ENV_VARS = {
     'GEMINI_API_KEY': 'Gemini API密钥',
     'WECHAT_APPID': '微信APPID',
     'WECHAT_APPSECRET': '微信APPSECRET',
-    'REDIS_HOST': 'Redis主机地址', # 新增 Redis 配置
-    'REDIS_PORT': 'Redis端口'     # 新增 Redis 配置
+    'REDIS_HOST': 'Redis主机地址', 
+    'REDIS_PORT': 'Redis端口'     
 }
 
 missing_vars = [name for name in REQUIRED_ENV_VARS if not os.environ.get(name)]
@@ -111,9 +111,12 @@ except Exception as e:
     raise RuntimeError(f"Redis 初始化失败: {e}")
 
 # Redis 键的前缀，用于区分不同类型的数据
-REDIS_KEY_PREFIX = "wechat_ai_result:"
-# AI 结果在 Redis 中的过期时间（秒），例如 24 小时
-AI_RESULT_EXPIRATION_SECONDS = 24 * 3600 
+REDIS_USER_AI_RESULT_PREFIX = "wechat_ai_result:" # 用户图片AI结果前缀
+REDIS_TEXT_CACHE_PREFIX = "wechat_text_cache:"    # 文本问答缓存前缀
+
+# AI 结果在 Redis 中的过期时间（秒）
+AI_RESULT_EXPIRATION_SECONDS = 24 * 3600 # 用户图片AI结果保存 24 小时
+TEXT_CACHE_EXPIRATION_SECONDS = 6 * 3600 # 文本问答缓存保存 6 小时
 
 # ==================== 核心功能 ====================
 access_token_cache = {"token": None, "expires_at": 0}
@@ -275,7 +278,7 @@ def handle_message():
                 <FromUserName><![CDATA[{to_user}]]></FromUserName>
                 <CreateTime>{int(time.time())}</CreateTime>
                 <MsgType><![CDATA[text]]></MsgType>
-                <Content><![CDATA[图片已收到，AI正在努力识别中，请耐心等待10-20秒后发送“查询图片结果”来获取。]]></Content>
+                <Content><![CDATA[图片已收到，AI正在努力识别中，请耐心等待10-20秒后发送“查询图片结果”来获取。[抱拳]]]></Content>
             </xml>"""
             
             # 在一个新线程中异步调用图片处理逻辑
@@ -335,13 +338,19 @@ def async_process_image(pic_url, from_user, to_user):
         logger.info(f"后台AI处理图片完成，总耗时: {time.time()-start_overall_time:.2f}秒。回复内容长度: {len(ai_response_content.encode('utf-8'))}字节")
 
         # ====== 新增：将AI结果存储到 Redis ======
-        redis_key = f"{REDIS_KEY_PREFIX}{from_user}"
+        redis_key = f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}"
         # 将结果存储为字符串，包含时间戳和内容
         # 如果需要存储多条，可以使用 Redis 的 List 或 Hash
         # 这里为了简化，只存储最新的结果
         value = f"{int(time.time())}|{ai_response_content}"
-        redis_client.set(redis_key, value, ex=AI_RESULT_EXPIRATION_SECONDS)
-        logger.info(f"AI结果已为用户 {from_user} 存储到 Redis (key: {redis_key})，有效期 {AI_RESULT_EXPIRATION_SECONDS} 秒。")
+        
+        try:
+            redis_client.set(redis_key, value, ex=AI_RESULT_EXPIRATION_SECONDS)
+            logger.info(f"AI图片结果已为用户 {from_user} 存储到 Redis (key: {redis_key})，有效期 {AI_RESULT_EXPIRATION_SECONDS} 秒。")
+        except redis.exceptions.ConnectionError as e:
+            logger.error(f"无法将 AI 图片结果存储到 Redis (连接错误): {e}")
+        except Exception as e:
+            logger.error(f"存储 AI 图片结果到 Redis 时发生未知错误: {e}")
         # ==========================================
         
     except Exception as e:
@@ -352,8 +361,16 @@ def query_image_result(from_user, to_user):
     """
     处理用户查询图片结果的请求，从 Redis 中获取结果。
     """
-    redis_key = f"{REDIS_KEY_PREFIX}{from_user}"
-    stored_value = redis_client.get(redis_key) # 获取存储的值
+    redis_key = f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}"
+    stored_value = None
+    try:
+        stored_value = redis_client.get(redis_key) # 获取存储的值
+    except redis.exceptions.ConnectionError as e:
+        logger.error(f"无法从 Redis 获取 AI 图片结果 (连接错误): {e}")
+        return build_reply(from_user, to_user, "抱歉，目前无法连接到结果存储服务，请稍后再试。")
+    except Exception as e:
+        logger.error(f"从 Redis 获取 AI 图片结果时发生未知错误: {e}")
+        return build_reply(from_user, to_user, "抱歉，查询结果时发生错误，请稍后再试。")
 
     if stored_value:
         # 解析存储的值
@@ -366,7 +383,7 @@ def query_image_result(from_user, to_user):
             content_to_reply = "抱歉，无法解析存储的图片识别结果，请重试。"
             logger.error(f"解析 Redis 存储值失败 for user {from_user}: {stored_value}")
     else:
-        content_to_reply = "AI正在努力识别中,请耐心等待。"
+        content_to_reply = "AI正在努力识别中，或您目前没有待查询的图片识别结果，或者结果已过期。请先发送一张图片让我识别。[抱拳]"
         logger.info(f"用户 {from_user} 查询图片结果，Redis 中无可用结果。")
     
     # 使用 build_reply 函数来统一处理文本或图片回复
@@ -375,9 +392,37 @@ def query_image_result(from_user, to_user):
 def process_text_message(content):
     """通过 Gemini 处理文本消息并返回 AI 生成的文本"""
     logger.info("调用 Gemini 处理文本...")
+    
+    # ====== 新增：文本问答缓存逻辑 ======
+    normalized_content = content.strip().lower() # 规范化内容作为缓存键
+    cache_key = f"{REDIS_TEXT_CACHE_PREFIX}{hashlib.md5(normalized_content.encode('utf-8')).hexdigest()}"
+    
+    cached_answer = None
     try:
-        # 文本消息不涉及图片下载和转换，通常速度快，可以同步处理
-        return generate_with_retry(content, is_image_context=False)
+        cached_answer = redis_client.get(cache_key)
+        if cached_answer:
+            logger.info(f"从 Redis 缓存中获取文本答案: {cached_answer[:50]}...")
+            return cached_answer
+    except redis.exceptions.ConnectionError as e:
+        logger.warning(f"无法从 Redis 获取文本缓存 (连接错误): {e}")
+    except Exception as e:
+        logger.warning(f"获取文本缓存时发生未知错误: {e}")
+
+    # 如果没有命中缓存，则调用 AI 模型
+    try:
+        ai_response_content = generate_with_retry(content, is_image_context=False)
+        
+        # 将 AI 答案存入缓存
+        if ai_response_content: # 确保AI有返回内容才缓存
+            try:
+                redis_client.set(cache_key, ai_response_content, ex=TEXT_CACHE_EXPIRATION_SECONDS)
+                logger.info(f"AI文本答案已存入 Redis 缓存 (key: {cache_key[:10]}...)，有效期 {TEXT_CACHE_EXPIRATION_SECONDS} 秒。")
+            except redis.exceptions.ConnectionError as e:
+                logger.warning(f"无法将 AI 文本答案存储到 Redis (连接错误): {e}")
+            except Exception as e:
+                logger.warning(f"存储 AI 文本答案到 Redis 时发生未知错误: {e}")
+
+        return ai_response_content
     except Exception as e:
         logger.error(f"处理文本消息时 AI 调用失败: {e}")
         return "AI处理文本失败，请稍后再试。"
@@ -422,12 +467,13 @@ def generate_with_retry(prompt, image=None, max_retries=3, is_image_context=Fals
                     request_options={"timeout": ai_api_request_timeout}
                 )
             
-            if response and response.text:
-                current_ai_duration = time.time() - start_overall_ai_time
-                logger.info(f"AI 生成成功，耗时: {current_ai_duration:.2f}秒 (单次尝试: {time.time()-start_single_attempt_time:.2f}秒)")
-                return response.text.strip()
-            
-            logger.warning(f"AI 返回了空内容或无效响应 (尝试 {retry_count+1}/{max_retries})。")
+            # Check if response or response.text is None and raise an error
+            if not response or not response.text:
+                raise ValueError("AI returned an empty or invalid response.")
+
+            current_ai_duration = time.time() - start_overall_ai_time
+            logger.info(f"AI 生成成功，耗时: {current_ai_duration:.2f}秒 (单次尝试: {time.time()-start_single_attempt_time:.2f}秒)")
+            return response.text.strip()
             
         except Exception as e:
             retry_count += 1
