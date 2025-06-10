@@ -275,7 +275,7 @@ def handle_message():
                 <FromUserName><![CDATA[{to_user}]]></FromUserName>
                 <CreateTime>{int(time.time())}</CreateTime>
                 <MsgType><![CDATA[text]]></MsgType>
-                <Content><![CDATA[图片已收到，AI正在努力识别中，请稍候...请稍后发送“查询图片结果”来获取。]]></Content>
+                <Content><![CDATA[图片已收到，AI正在努力识别中，请耐心等待10-20秒后发送“查询图片结果”来获取。]]></Content>
             </xml>"""
             
             # 在一个新线程中异步调用图片处理逻辑
@@ -366,7 +366,7 @@ def query_image_result(from_user, to_user):
             content_to_reply = "抱歉，无法解析存储的图片识别结果，请重试。"
             logger.error(f"解析 Redis 存储值失败 for user {from_user}: {stored_value}")
     else:
-        content_to_reply = "您目前没有待查询的图片识别结果，或者结果已过期。请先发送一张图片让我识别。"
+        content_to_reply = "AI正在努力识别中,请耐心等待。"
         logger.info(f"用户 {from_user} 查询图片结果，Redis 中无可用结果。")
     
     # 使用 build_reply 函数来统一处理文本或图片回复
