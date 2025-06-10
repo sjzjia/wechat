@@ -535,7 +535,7 @@ def generate_with_retry(prompt, image=None, max_retries=3, is_image_context=Fals
         temperature=0.7,
         top_p=0.9,
         top_k=40,
-        max_output_tokens=1024
+        max_output_tokens=8192
     )
     start_overall_ai_time = time.time()
     while retry_count < max_retries:
@@ -658,26 +658,104 @@ def text_to_image(text, max_width=600, font_size=24):
         padding = 30
         line_spacing = 10
         font = ImageFont.truetype(FONT_PATH, font_size)
-        avg_char_width = font.getlength('中') 
-        chars_per_line = int((max_width - 2 * padding) / avg_char_width)
-        if chars_per_line <= 0:
-            chars_per_line = 1 
+
+        # 动态计算每行能够容纳的字符数，更准确地估算
+        # 获取一个平均字符的宽度（例如，通过'中'字和'A'字的平均，或者更复杂的统计）
+        # 这里为了简化，我们依然使用'中'字作为基准，但会结合实际渲染宽度进行微调
+        avg_char_width_zh = font.getlength('中')
+        avg_char_width_en = font.getlength('A')
+        
+        # 尝试一个更精细的换行逻辑，避免 textwrap.wrap 带来的问题
         wrapped_lines = []
+        current_line_buffer = []
+        current_line_width = 0
+        max_line_content_width = max_width - 2 * padding
+        
+        # 为了确保长单词不被截断，并让 textwrap 能更好地工作，
+        # 我们先用 textwrap 处理，然后对超宽的行进行进一步拆分（如果需要）
+        # 更好的方法是完全手动处理文本，按像素宽度进行换行，但更复杂。
+        # 这里尝试结合 textwrap 的便捷性，并进行后处理。
+
         for paragraph in text.split('\n'):
             if not paragraph.strip():
-                wrapped_lines.append('')
-            else:
-                wrapped_lines.extend(textwrap.wrap(paragraph, width=chars_per_line, break_long_words=False, replace_whitespace=False))
+                wrapped_lines.append('') # 保留空行
+                continue
+
+            # 使用 textwrap.wrap 进行初步分行，但不对其结果完全信任
+            # 这里的chars_per_line只是一个粗略的参考，实际换行会更精确
+            # roughly_chars_per_line = int(max_line_content_width / ((avg_char_width_zh + avg_char_width_en) / 2))
+            # if roughly_chars_per_line <= 0:
+            #     roughly_chars_per_line = 1
+            
+            # 使用一个较大的初始宽度，让textwrap尽量不打断太短的词
+            # 然后我们再用像素宽度检查
+            # 为了确保 textwrap 不会因为粗略的 chars_per_line 提前打断，
+            # 我们可以设置一个足够大的 width，然后自行处理超宽的行
+            initial_wrapped = textwrap.wrap(paragraph, width=500, break_long_words=False, replace_whitespace=False) 
+            
+            for word_or_segment in initial_wrapped:
+                # 重新构建行，按实际像素宽度检查
+                temp_line_width = font.getlength(word_or_segment)
+                if current_line_width + temp_line_width > max_line_content_width and current_line_buffer:
+                    # 如果当前行加上新内容会超宽，并且当前行已有内容，则将当前行添加到结果中
+                    wrapped_lines.append("".join(current_line_buffer))
+                    current_line_buffer = [word_or_segment]
+                    current_line_width = temp_line_width
+                elif temp_line_width > max_line_content_width:
+                    # 如果一个单词或一个分段本身就超宽，则强制进行更细粒度的拆分
+                    # 这是一个简化的处理，对于非常长的不可断开的字符串仍然可能截断
+                    sub_segment = ""
+                    for char in word_or_segment:
+                        char_width = font.getlength(char)
+                        if font.getlength(sub_segment + char) <= max_line_content_width:
+                            sub_segment += char
+                        else:
+                            wrapped_lines.append(sub_segment)
+                            sub_segment = char
+                    if sub_segment:
+                        wrapped_lines.append(sub_segment)
+                    current_line_buffer = []
+                    current_line_width = 0
+                else:
+                    # 将内容添加到当前行
+                    current_line_buffer.append(word_or_segment)
+                    current_line_width += temp_line_width # 累加估计宽度，不够精确但比chars_per_line强
+
+            if current_line_buffer:
+                wrapped_lines.append("".join(current_line_buffer))
+                current_line_buffer = []
+                current_line_width = 0 # 重置
+
         if not wrapped_lines:
             wrapped_lines = [""]
+
+        # 计算图片高度
         line_height = font_size + line_spacing
         img_height = 2 * padding + len(wrapped_lines) * line_height
+
+        # 确保图片高度不会过大，防止生成超大图，微信有图片大小限制
+        MAX_IMG_HEIGHT = 4000 # 微信图片大小限制通常在2MB以内，太高的图片可能超出
+        if img_height > MAX_IMG_HEIGHT:
+            logger.warning(f"图片高度超过限制 {MAX_IMG_HEIGHT}px，原始高度 {img_height}px，将截断内容。")
+            # 重新计算能容纳的行数
+            displayable_lines = int((MAX_IMG_HEIGHT - 2 * padding) / line_height)
+            wrapped_lines = wrapped_lines[:displayable_lines]
+            img_height = 2 * padding + len(wrapped_lines) * line_height
+            # 添加提示信息
+            if img_height > 2 * padding: # 确保有足够空间添加提示
+                wrapped_lines.append("...") # 添加省略号表示内容被截断
+                wrapped_lines.append("(内容过长，已截断)")
+                img_height += 2 * line_height # 为提示信息增加高度
+
+
         img = Image.new("RGB", (max_width, img_height), (255, 255, 255))
         draw = ImageDraw.Draw(img)
+
         y = padding
         for line in wrapped_lines:
             draw.text((padding, y), line, font=font, fill=(0, 0, 0))
             y += line_height
+
         watermark = "AI生成内容"
         watermark_font = ImageFont.truetype(FONT_PATH, int(font_size * 0.8))
         watermark_width = watermark_font.getlength(watermark)
@@ -687,6 +765,7 @@ def text_to_image(text, max_width=600, font_size=24):
             font=watermark_font,
             fill=(200, 200, 200)
         )
+
         output = io.BytesIO()
         img.save(output, format='PNG', optimize=True, quality=90)
         logger.info(f"文本转图片耗时: {time.time()-start_time_img_gen:.2f}秒")
