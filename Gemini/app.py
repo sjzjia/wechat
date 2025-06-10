@@ -2,7 +2,7 @@ import hashlib
 import time
 import requests
 from flask import Flask, request, make_response
-from xml.etree import ElementTree as ET
+from defusedxml.ElementTree import fromstring  # 安全的 XML 解析
 from xml.sax.saxutils import escape
 import logging
 import google.generativeai as genai
@@ -22,7 +22,10 @@ WECHAT_TOKEN = os.environ.get("WECHAT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
 
-# 微信签名验证
+if not WECHAT_TOKEN or not GEMINI_API_KEY:
+    logger.critical("环境变量 WECHAT_TOKEN 或 GEMINI_API_KEY 未设置。")
+    raise EnvironmentError("缺少必要环境变量：WECHAT_TOKEN / GEMINI_API_KEY")
+
 def check_signature(signature, timestamp, nonce):
     tmp_list = sorted([WECHAT_TOKEN, timestamp, nonce])
     tmp_str = ''.join(tmp_list).encode('utf-8')
@@ -30,17 +33,15 @@ def check_signature(signature, timestamp, nonce):
     logger.debug(f"check_signature: {signature} == {tmp_str}")
     return tmp_str == signature
 
-# 截取消息内容
 def truncate_message(content, max_length=2000):
-    content_bytes = content.encode('utf-8')
-    if len(content_bytes) > max_length:
-        content = content_bytes[:max_length].decode('utf-8', 'ignore')
+    while len(content.encode('utf-8')) > max_length:
+        content = content[:-1]
     return content
 
-# 处理用户消息
 def handle_message(xml_data):
+    from_user = to_user = ""
     try:
-        xml = ET.fromstring(xml_data)
+        xml = fromstring(xml_data)
         msg_type = xml.find('MsgType').text
         from_user = xml.find('FromUserName').text
         to_user = xml.find('ToUserName').text
@@ -63,7 +64,10 @@ def handle_message(xml_data):
                 image_data = requests.get(pic_url, timeout=10).content
                 image = Image.open(io.BytesIO(image_data))
                 image.verify()  # 验证图片格式
-                image = Image.open(io.BytesIO(image_data))  # 重新打开用于模型输入
+                image = Image.open(io.BytesIO(image_data))  # 重载用于模型分析
+
+                if image.format not in ['JPEG', 'PNG', 'WEBP']:
+                    raise ValueError("不支持的图片格式")
 
                 prompt = "请用中文详细描述这张图片的内容，并尽可能分析它的含义。"
                 response = model.generate_content([prompt, image])
@@ -79,7 +83,6 @@ def handle_message(xml_data):
         else:
             reply_content = "暂不支持该类型的消息，请发送文字或图片。"
 
-        # 安全处理和截断
         reply_content = truncate_message(reply_content, 2048)
         reply_content = escape(reply_content)
 
@@ -94,14 +97,11 @@ def handle_message(xml_data):
             """
         return reply_xml
 
-    except ET.ParseError as e:
-        logger.error(f"XML parsing error: {e}, xml_data: {xml_data}, traceback: {traceback.format_exc()}")
-        return make_error_xml("XML 解析错误", from_user, to_user)
     except Exception as e:
-        logger.error(f"Error while handling message: {e}, xml_data: {xml_data}, traceback: {traceback.format_exc()}")
+        logger.error(f"处理消息异常: {e}, xml_data: {xml_data}, traceback: {traceback.format_exc()}")
         return make_error_xml("抱歉，处理消息时发生了错误。", from_user, to_user)
 
-def make_error_xml(content, from_user, to_user):
+def make_error_xml(content, from_user='', to_user=''):
     safe_content = escape(content)
     return f"""
         <xml>
@@ -113,14 +113,12 @@ def make_error_xml(content, from_user, to_user):
         </xml>
         """
 
-# 发送微信回复消息
 def send_reply(reply_xml):
     logger.debug(f"Sending reply: {reply_xml}")
     response = make_response(reply_xml)
     response.content_type = 'application/xml'
     return response
 
-# 微信服务器验证和消息处理
 @app.route('/', methods=['GET', 'POST'])
 def wechat():
     if request.method == 'GET':
@@ -145,6 +143,6 @@ def wechat():
         reply_xml = handle_message(xml_data)
         return send_reply(reply_xml)
 
-# 启动 Flask 应用（HTTP）
+# Gunicorn 启动时不需要 app.run()
 # if __name__ == '__main__':
-#    app.run(host='0.0.0.0', port=80)
+#     app.run(host='0.0.0.0', port=80)
