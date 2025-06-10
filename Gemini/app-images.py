@@ -447,13 +447,34 @@ def clean_content(content, max_bytes=None):
     if not content:
         return ""
     
-    # 移除常用的 Markdown 标记
-    content = re.sub(r'(\*\*|__|\*|_|`|~~|\n{2,})', '\n', content) # 将多个换行符也替换为单个
-    content = re.sub(r'#+\s*', '', content) # 移除 Markdown 标题
-    content = re.sub(r'\[(.*?)\]\((.*?)\)', r'\1', content) # 移除 Markdown 链接
+    # 步骤一：移除常用的 Markdown 标记
+    # 这个正则会移除 **text**, __text__, *text*, _text_, `code`, ~~strike~~, # Heading, [link](url)
+    content = re.sub(r'(\*\*|__|\*|_|`|~~|#+\s*|\[.*?\]\(.*?\))', '', content)
 
-    # 合并多余的空行并去除首尾空白
-    content = re.sub(r'\n{2,}', '\n\n', content).strip()
+    # 步骤二：规范化所有换行符和空白字符，并为列表项添加简单标记
+    processed_lines = []
+    # 将文本按行分割，并处理每一行
+    for line in content.split('\n'):
+        stripped_line = line.strip() # 移除行首尾空格
+
+        if not stripped_line: # 如果是空行，直接添加
+            processed_lines.append('')
+        elif re.match(r'^\s*[-*+]?\s*', line): # 检查是否是列表项（以 - * + 开头或仅有缩进）
+            # 移除行首所有空白，然后加一个短划线和空格作为列表标记，再拼接原内容
+            # 这会把AI生成的列表项前的缩进和符号统一成统一的 "- "
+            processed_lines.append(stripped_line)
+        else:
+            processed_lines.append(stripped_line) # 普通行直接添加
+
+    # 将处理过的行用单个换行符重新连接起来
+    content = '\n'.join(processed_lines)
+    
+    # 步骤三：合并多余的空行：将两个或更多连续的换行符替换为两个换行符（即一个空行）
+    # 这会保留段落间的空白，使文本更易读
+    content = re.sub(r'\n{2,}', '\n\n', content)
+
+    # 步骤四：最后清理整个文本的首尾空白
+    content = content.strip()
 
     # 字节数检查和截断 (仅当 max_bytes 提供时才执行)
     if max_bytes is not None:
