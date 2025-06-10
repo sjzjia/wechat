@@ -17,7 +17,9 @@ docker run -d \
 
 **注意：由于个人公众号不能使用客服消息接口，所以使用redis存储结果，需要redis 容器**  
 
-容器启动示例docker run -itd -e WECHAT_TOKEN="WECHAT_TOKEN" -e GEMINI_API_KEY="GEMINI_API_KEY"  -e WECHAT_APPID="WECHAT_APPID" -e WECHAT_APPSECRET="WECHAT_APPSECRET" -e REDIS_HOST="redis" -e REDIS_PORT="6379" --link=redis --name gemini gemini
+容器启动示例docker run -itd -e WECHAT_TOKEN="WECHAT_TOKEN" -e GEMINI_API_KEY="GEMINI_API_KEY"  -e WECHAT_APPID="WECHAT_APPID" -e WECHAT_APPSECRET="WECHAT_APPSECRET" -e REDIS_HOST="redis" -e REDIS_PORT="6379" --link=redis --name gemini gemini  
 
-实例：<img width="809" alt="image" src="https://github.com/user-attachments/assets/69a91d4e-e046-4a69-8de6-87212a57c7f2" />
+下面是个实例，如果发送过去是图片或者回复的数字超过 2000 字节的都需要这种方式获取结果，因为公众号限制不能大于2048字节
+
+<img width="809" alt="image" src="https://github.com/user-attachments/assets/69a91d4e-e046-4a69-8de6-87212a57c7f2" />
 
