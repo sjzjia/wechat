@@ -11,6 +11,7 @@ from PIL import Image, ImageDraw, ImageFont
 import io
 import traceback
 import re
+import textwrap
 
 app = Flask(__name__)
 
@@ -25,7 +26,7 @@ APPID = os.environ.get("WECHAT_APPID")
 APPSECRET = os.environ.get("WECHAT_APPSECRET")
 FONT_PATH = "SourceHanSansSC-Regular.otf"
 
-# 校验
+# 环境变量和字体文件校验
 if not WECHAT_TOKEN or not GEMINI_API_KEY or not APPID or not APPSECRET:
     logger.critical("缺少必要环境变量：WECHAT_TOKEN / GEMINI_API_KEY / WECHAT_APPID / WECHAT_APPSECRET")
     raise EnvironmentError("缺少必要环境变量")
@@ -60,7 +61,7 @@ def get_access_token():
 def upload_image_to_wechat(image_bytes):
     access_token = get_access_token()
     if not access_token:
-        logger.error("无效 access_token")
+        logger.error("无效 access_token，上传图片失败")
         return None
     try:
         url = f"https://api.weixin.qq.com/cgi-bin/media/upload?access_token={access_token}&type=image"
@@ -78,41 +79,48 @@ def check_signature(signature, timestamp, nonce):
     return hashlib.sha1(tmp_str).hexdigest() == signature
 
 def clean_and_truncate(content, max_bytes=2000):
+    # 去除 Markdown 样式符号和多余空行
     content = re.sub(r'(\*\*|__|\*|_|`|~~)', '', content)
     content = re.sub(r'\n\s*\n+', '\n', content).strip()
     encoded = content.encode('utf-8')
-    return encoded[:max_bytes].decode('utf-8', errors='ignore') if len(encoded) > max_bytes else content
+    if len(encoded) > max_bytes:
+        truncated = encoded[:max_bytes]
+        return truncated.decode('utf-8', errors='ignore')
+    else:
+        return content
 
 def text_to_image(text):
     try:
         font_size = 24
-        font = ImageFont.truetype(FONT_PATH, font_size)
         max_width = 600
-        temp_img = Image.new("RGB", (max_width, 1000))
-        draw = ImageDraw.Draw(temp_img)
-        lines, line = [], ""
-        for char in text:
-            bbox = draw.textbbox((0, 0), line + char, font=font)
-            if bbox[2] - bbox[0] <= max_width:
-                line += char
-            else:
-                lines.append(line)
-                line = char
-        if line:
-            lines.append(line)
-        line_height = draw.textbbox((0, 0), "A", font=font)[3] + 8
-        img_height = line_height * len(lines) + 20
-        image = Image.new("RGB", (max_width + 20, img_height), (255, 255, 255))
+        padding = 20
+        font = ImageFont.truetype(FONT_PATH, font_size)
+
+        # 计算每行最多字符数，按平均字符宽度估算
+        bbox = font.getbbox('汉')
+        avg_char_width = bbox[2] - bbox[0]
+        max_chars_per_line = max((max_width - 2 * padding) // avg_char_width, 1)
+
+        # 用 textwrap 按字符数断行
+        lines = textwrap.wrap(text, width=max_chars_per_line)
+
+        line_height = font_size + 10
+        img_height = padding * 2 + line_height * len(lines)
+
+        image = Image.new("RGB", (max_width, img_height), (255, 255, 255))
         draw = ImageDraw.Draw(image)
-        y = 10
+
+        y = padding
         for line in lines:
-            draw.text((10, y), line, font=font, fill=(0, 0, 0))
+            draw.text((padding, y), line, font=font, fill=(0, 0, 0))
             y += line_height
+
         output = io.BytesIO()
         image.save(output, format='PNG')
         return output.getvalue()
+
     except Exception as e:
-        logger.error(f"文字转图片失败: {e}")
+        logger.error(f"文字转图片失败: {e}\n{traceback.format_exc()}")
         return None
 
 def handle_message(xml_data):
@@ -126,68 +134,72 @@ def handle_message(xml_data):
         pic_url = xml.find('PicUrl').text if msg_type == 'image' else ''
         model = genai.GenerativeModel('gemini-2.0-flash')
 
-        if msg_type == 'text':
-            logger.debug(f"收到文本消息: {content}")
-            prompt = content + "\n请用简洁的语言回复，不超过300字。"
-            try:
-                response = model.generate_content(prompt)
-                reply_content = response.text.strip() if response and response.text else "AI 没有返回任何内容。"
-                logger.debug(f"Gemini 回复: {reply_content}")
-            except Exception as e:
-                logger.error(f"Gemini 回复失败: {e}")
-                reply_content = "AI 回复失败，请稍后再试。"
+        if msg_type == 'text' or msg_type == 'image':
+            if msg_type == 'text':
+                logger.debug(f"收到文本消息: {content}")
+                prompt = content # 不再限制字数或额外提示
+#                prompt = content + "\n请用简洁的语言回复，不超过300字。"
+                try:
+                    response = model.generate_content(prompt)
+                    reply_content = response.text.strip() if response and response.text else "AI 没有返回任何内容。"
+                except Exception as e:
+                    logger.error(f"Gemini 回复失败: {e}\n{traceback.format_exc()}")
+                    reply_content = "AI 回复失败，请稍后再试。"
+            elif msg_type == 'image':
+                try:
+                    logger.debug(f"收到图片消息: {pic_url}")
+                    image_data = requests.get(pic_url, timeout=10).content
+                    image = Image.open(io.BytesIO(image_data))
+                    image.verify()  # 验证图片有效性
+                    image = Image.open(io.BytesIO(image_data))  # 重新打开图片用于传入
+                    prompt = "请用中文详细描述这张图片的内容，并尽可能分析它的含义。"
+                    response = model.generate_content([prompt, image])
+                    reply_content = response.text.strip() if response and response.text else "AI 没有返回任何内容。"
+                except Exception as e:
+                    logger.error(f"处理图片失败: {e}\n{traceback.format_exc()}")
+                    reply_content = "图片处理失败，请换一张试试。"
 
+            reply_content = clean_and_truncate(reply_content)
             img_data = text_to_image(reply_content)
             if img_data:
                 media_id = upload_image_to_wechat(img_data)
                 if media_id:
-                    return f"""<xml><ToUserName><![CDATA[{from_user}]]></ToUserName>
-                    <FromUserName><![CDATA[{to_user}]]></FromUserName>
-                    <CreateTime>{int(time.time())}</CreateTime>
-                    <MsgType><![CDATA[image]]></MsgType>
-                    <Image><MediaId><![CDATA[{media_id}]]></MediaId></Image></xml>"""
+                    # 返回图片消息XML
+                    return f"""<xml>
+                        <ToUserName><![CDATA[{from_user}]]></ToUserName>
+                        <FromUserName><![CDATA[{to_user}]]></FromUserName>
+                        <CreateTime>{int(time.time())}</CreateTime>
+                        <MsgType><![CDATA[image]]></MsgType>
+                        <Image><MediaId><![CDATA[{media_id}]]></MediaId></Image>
+                    </xml>"""
 
-            # 回退文本
-            return f"""<xml><ToUserName><![CDATA[{from_user}]]></ToUserName>
-            <FromUserName><![CDATA[{to_user}]]></FromUserName>
-            <CreateTime>{int(time.time())}</CreateTime>
-            <MsgType><![CDATA[text]]></MsgType>
-            <Content><![CDATA[{escape(reply_content)}]]></Content></xml>"""
-
-        elif msg_type == 'image':
-            try:
-                logger.debug(f"收到图片消息: {pic_url}")
-                image_data = requests.get(pic_url, timeout=10).content
-                image = Image.open(io.BytesIO(image_data))
-                image.verify()
-                image = Image.open(io.BytesIO(image_data))
-                prompt = "请用中文详细描述这张图片的内容，并尽可能分析它的含义。"
-                response = model.generate_content([prompt, image])
-                reply_content = response.text.strip() if response and response.text else "AI 没有返回任何内容。"
-            except Exception as e:
-                logger.error(f"处理图片失败: {e}")
-                reply_content = "图片处理失败，请换一张试试。"
-            reply_content = clean_and_truncate(reply_content)
-            return f"""<xml><ToUserName><![CDATA[{from_user}]]></ToUserName>
-            <FromUserName><![CDATA[{to_user}]]></FromUserName>
-            <CreateTime>{int(time.time())}</CreateTime>
-            <MsgType><![CDATA[text]]></MsgType>
-            <Content><![CDATA[{escape(reply_content)}]]></Content></xml>"""
+            # 图片上传失败或文字转图片失败，退回文本回复
+            return f"""<xml>
+                <ToUserName><![CDATA[{from_user}]]></ToUserName>
+                <FromUserName><![CDATA[{to_user}]]></FromUserName>
+                <CreateTime>{int(time.time())}</CreateTime>
+                <MsgType><![CDATA[text]]></MsgType>
+                <Content><![CDATA[{escape(reply_content)}]]></Content>
+            </xml>"""
 
         else:
-            return f"""<xml><ToUserName><![CDATA[{from_user}]]></ToUserName>
-            <FromUserName><![CDATA[{to_user}]]></FromUserName>
-            <CreateTime>{int(time.time())}</CreateTime>
-            <MsgType><![CDATA[text]]></MsgType>
-            <Content><![CDATA[暂不支持该类型的消息]]></Content></xml>"""
+            return f"""<xml>
+                <ToUserName><![CDATA[{from_user}]]></ToUserName>
+                <FromUserName><![CDATA[{to_user}]]></FromUserName>
+                <CreateTime>{int(time.time())}</CreateTime>
+                <MsgType><![CDATA[text]]></MsgType>
+                <Content><![CDATA[暂不支持该类型的消息]]></Content>
+            </xml>"""
 
     except Exception as e:
         logger.error(f"处理消息异常: {e}\n{traceback.format_exc()}")
-        return f"""<xml><ToUserName><![CDATA[{from_user}]]></ToUserName>
-        <FromUserName><![CDATA[{to_user}]]></FromUserName>
-        <CreateTime>{int(time.time())}</CreateTime>
-        <MsgType><![CDATA[text]]></MsgType>
-        <Content><![CDATA[处理失败，请稍后重试]]></Content></xml>"""
+        return f"""<xml>
+            <ToUserName><![CDATA[{from_user}]]></ToUserName>
+            <FromUserName><![CDATA[{to_user}]]></FromUserName>
+            <CreateTime>{int(time.time())}</CreateTime>
+            <MsgType><![CDATA[text]]></MsgType>
+            <Content><![CDATA[处理失败，请稍后重试]]></Content>
+        </xml>"""
 
 def send_reply(reply_xml):
     logger.debug(f"发送回复: {reply_xml}")
@@ -202,14 +214,19 @@ def wechat():
         timestamp = request.args.get('timestamp', '')
         nonce = request.args.get('nonce', '')
         echostr = request.args.get('echostr', '')
-        return echostr if check_signature(signature, timestamp, nonce) else '验证失败'
+        if check_signature(signature, timestamp, nonce):
+            return echostr
+        else:
+            logger.warning(f"微信验证失败，signature={signature} timestamp={timestamp} nonce={nonce}")
+            return '验证失败'
     elif request.method == 'POST':
         if request.content_type != 'text/xml':
+            logger.warning(f"不支持的 Content-Type: {request.content_type}")
             return "不支持的 Content-Type", 400
         xml_data = request.data
         reply_xml = handle_message(xml_data)
         return send_reply(reply_xml)
 
-# Gunicorn 启动时不需要 app.run()
+# Gunicorn 启动时不需要使用 app.run()
 # if __name__ == '__main__':
 #     app.run(host='0.0.0.0', port=80)
