@@ -73,6 +73,9 @@ WECHAT_ACCESS_TOKEN_TIMEOUT = int(os.environ.get('WECHAT_ACCESS_TOKEN_TIMEOUT', 
 WECHAT_MEDIA_UPLOAD_TIMEOUT = int(os.environ.get('WECHAT_MEDIA_UPLOAD_TIMEOUT', 10)) # 微信媒体上传超时
 IMAGE_DOWNLOAD_TIMEOUT = int(os.environ.get('IMAGE_DOWNLOAD_TIMEOUT', 10)) # 图片下载超时
 
+# 文本转图片限制
+MAX_IMG_HEIGHT = 4000 # 生成图片的最大高度，防止生成超大图片
+
 # ==================== 初始化配置 ====================
 def setup_logging():
     """配置详细的日志记录系统"""
@@ -173,7 +176,7 @@ try:
         socket_timeout=REDIS_SOCKET_TIMEOUT,
         decode_responses=True,
         health_check_interval=REDIS_HEALTH_CHECK_INTERVAL,
-        retry_on_timeout=True
+        retry_on_timeout=True # 增强重试机制
     )
     redis_client = redis.Redis(connection_pool=REDIS_CONNECTION_POOL)
     redis_client.ping()
@@ -185,24 +188,12 @@ except Exception as e:
     logger.critical(f"Redis 初始化失败: {e}")
     raise RuntimeError(f"Redis 初始化失败: {e}")
 
-# @app.teardown_request
-# def check_redis_connections(exc):
-#     """
-#     在请求结束时检查Redis连接（仅为调试和监控，非必要）。
-#     由于使用了连接池，这里通常不需要显式地ping。
-#     """
-#     try:
-#         redis_client.ping()
-#         logger.debug("Redis 连接在请求结束时仍可用。")
-#     except Exception as e:
-#         logger.warning(f"检查 Redis 连接时发生错误: {e}")
-
 
 # ==================== 核心功能 - Access Token ====================
 access_token_cache = {"token": None, "expires_at": 0}
 token_lock = threading.Lock()
 
-def get_access_token() -> Union[str, None]: # 修改此处
+def get_access_token() -> Union[str, None]:
     """
     获取微信 access_token，使用缓存并支持自动刷新。
     """
@@ -325,7 +316,7 @@ def is_safe_url(url: str, dns_timeout: int = 2) -> bool:
         try:
             # 尝试直接解析主机名，如果它是 IP 地址，直接检查
             if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", parsed_url.hostname) or \
-               ':' in parsed_url.hostname: # 简单的IPv6判断，更精确的正则会更复杂
+               re.match(r"^([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$", parsed_url.hostname): # 简单的IPv6判断
                 if is_private_ip(parsed_url.hostname):
                     logger.warning(f"URL主机是私有IP地址: {parsed_url.hostname} for URL: {url[:100]}...")
                     return False
@@ -376,9 +367,24 @@ def handle_message():
         xml_data = request.data
         logger.debug(f"原始XML数据: {xml_data.decode('utf-8', errors='ignore')[:500]}...")
         xml = fromstring(xml_data)
-        msg_type = xml.find('MsgType').text
-        from_user = xml.find('FromUserName').text
-        to_user = xml.find('ToUserName').text
+        
+        msg_type_element = xml.find('MsgType')
+        if msg_type_element is None or not msg_type_element.text:
+            logger.error("XML消息中缺少 MsgType 字段或为空。")
+            return make_response("Invalid XML: Missing MsgType", 400)
+        msg_type = msg_type_element.text
+
+        from_user_element = xml.find('FromUserName')
+        if from_user_element is None or not from_user_element.text:
+            logger.error("XML消息中缺少 FromUserName 字段或为空。")
+            return make_response("Invalid XML: Missing FromUserName", 400)
+        from_user = from_user_element.text
+
+        to_user_element = xml.find('ToUserName')
+        if to_user_element is None or not to_user_element.text:
+            logger.error("XML消息中缺少 ToUserName 字段或为空。")
+            return make_response("Invalid XML: Missing ToUserName", 400)
+        to_user = to_user_element.text
 
         logger.info(f"消息类型: {msg_type}, 来自用户: {from_user}, 发送给: {to_user}")
 
@@ -744,7 +750,7 @@ def build_reply(from_user: str, to_user: str, content: str) -> requests.Response
         </xml>"""
         return make_response(error_xml_str, 500, {'Content-Type': 'application/xml'})
 
-def clean_content(content: str, max_bytes: Union[int, None] = None) -> str: # 修改此处
+def clean_content(content: str, max_bytes: Union[int, None] = None) -> str:
     """
     清理文本内容，移除Markdown标记、多余空格和连续空行，并可选地按字节截断。
     """
@@ -753,8 +759,10 @@ def clean_content(content: str, max_bytes: Union[int, None] = None) -> str: # �
     
     # 移除常见的Markdown标记，但保留换行
     content = re.sub(r'(\*\*|__|\*|_|`|~~|#+\s*)', '', content)
-    # 移除链接的Markdown格式，只保留文本
-    content = re.sub(r'\[(.*?)\]\(.*?\)', r'\1', content)
+    # 移除链接的Markdown格式，只保留链接文本
+    content = re.sub(r'\[([^\]]+?)\]\(.*?\)', r'\1', content)
+    # 移除图片链接的Markdown格式
+    content = re.sub(r'!\[.*?\]\(.*?\)', '', content)
 
     processed_lines = []
     for paragraph in content.split('\n'):
@@ -781,7 +789,7 @@ def clean_content(content: str, max_bytes: Union[int, None] = None) -> str: # �
             return truncated_content
     return content
 
-def text_to_image(text: str, max_width: int = 600, font_size: int = 24, line_spacing_factor: float = 0.5) -> Union[bytes, None]: # 修改此处
+def text_to_image(text: str, max_width: int = 600, font_size: int = 24, line_spacing_factor: float = 0.5) -> Union[bytes, None]:
     """
     将文本转换为图片。
     参数:
@@ -804,25 +812,36 @@ def text_to_image(text: str, max_width: int = 600, font_size: int = 24, line_spa
         wrapped_lines = []
         max_line_content_width = max_width - 2 * padding
 
+        # 逐段处理文本，确保空行被保留
         for paragraph in text.split('\n'):
             if not paragraph.strip():
-                wrapped_lines.append('') # 保留空行
+                wrapped_lines.append('') # 保留完全的空行
                 continue
 
-            current_line = []
-            current_line_width = 0
-            for char in paragraph:
-                char_width = font.getlength(char) if FONT_PATH else font.getbbox(char)[2] # getlength更精确，getbbox兼容默认字体
-                if current_line_width + char_width <= max_line_content_width:
-                    current_line.append(char)
-                    current_line_width += char_width
-                else:
-                    if current_line:
-                        wrapped_lines.append("".join(current_line))
-                    current_line = [char]
-                    current_line_width = char_width
-            if current_line:
-                wrapped_lines.append("".join(current_line))
+            # 使用 textwrap 模块进行智能换行，考虑中文
+            # getlength 适用于 truetype 字体，getbbox 适用于 Pillow 默认字体
+            if FONT_PATH:
+                # 对于非英文字体，getlength 相对准确
+                lines_for_paragraph = []
+                current_line = []
+                current_line_width = 0
+                for char in paragraph:
+                    char_width = font.getlength(char) if current_line else font.getlength(char) # getlength在单个字符时可能不准
+                    if current_line_width + char_width <= max_line_content_width:
+                        current_line.append(char)
+                        current_line_width += char_width
+                    else:
+                        if current_line:
+                            lines_for_paragraph.append("".join(current_line))
+                        current_line = [char]
+                        current_line_width = font.getlength(char)
+                if current_line:
+                    lines_for_paragraph.append("".join(current_line))
+                wrapped_lines.extend(lines_for_paragraph)
+            else:
+                # 对于默认字体，textwrap 结合 getbbox
+                temp_wrapped = textwrap.wrap(paragraph, width=int(max_line_content_width / (font_size * 0.6))) # 粗略估算字符数
+                wrapped_lines.extend(temp_wrapped)
 
 
         if not wrapped_lines:
@@ -833,26 +852,22 @@ def text_to_image(text: str, max_width: int = 600, font_size: int = 24, line_spa
         img_height = 2 * padding + len(wrapped_lines) * line_height
 
         # 确保图片高度不会过大，防止生成超大图
-        MAX_IMG_HEIGHT = 4000
         if img_height > MAX_IMG_HEIGHT:
             logger.warning(f"图片高度超过限制 {MAX_IMG_HEIGHT}px，原始高度 {img_height}px，将截断内容。")
             # 重新计算能容纳的行数
-            # 预留两行给提示信息，再减去上下padding和提示行的line_height
-            displayable_lines = int((MAX_IMG_HEIGHT - 2 * padding - 2 * line_height) / line_height)
-            if displayable_lines < 0: # 极端情况，如果连提示信息都放不下
-                displayable_lines = 0
+            displayable_lines = int((MAX_IMG_HEIGHT - 2 * padding) / line_height) - 2 # 预留两行给提示信息
+            
+            if displayable_lines < 0:
+                displayable_lines = 0 # 极端情况，至少显示空白图片
             
             wrapped_lines = wrapped_lines[:displayable_lines]
-            img_height = 2 * padding + len(wrapped_lines) * line_height # 重新计算高度
-
+            
             # 添加提示信息
-            if img_height + 2 * line_height <= MAX_IMG_HEIGHT: # 确保有足够空间添加提示
+            if len(wrapped_lines) > 0: # 只有当还有内容时才加提示
                 wrapped_lines.append("...") # 添加省略号表示内容被截断
                 wrapped_lines.append("(内容过长，已截断)")
-                img_height += 2 * line_height # 为提示信息增加高度
-            else:
-                # 实在放不下了，就只保留原始内容，不加提示了
-                pass
+            
+            img_height = 2 * padding + len(wrapped_lines) * line_height # 重新计算高度
 
 
         img = Image.new("RGB", (max_width, img_height), (255, 255, 255))
@@ -890,7 +905,7 @@ def text_to_image(text: str, max_width: int = 600, font_size: int = 24, line_spa
         logger.error(f"文本转换为图片失败: {e}\n{traceback.format_exc()}")
         return None
 
-def upload_image_to_wechat(image_bytes: bytes) -> Union[str, None]: # 修改此处
+def upload_image_to_wechat(image_bytes: bytes) -> Union[str, None]:
     """
     将图片上传到微信服务器，获取 media_id。
     """
