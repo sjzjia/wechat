@@ -38,8 +38,8 @@ UNSAFE_URL_REPLY = "抱歉，检测到图片链接可能存在安全风险，已
 
 REDIS_USER_AI_RESULT_PREFIX = "wechat_ai_result:"
 REDIS_TEXT_CACHE_PREFIX = "wechat_text_cache:"
-AI_RESULT_EXPIRATION_SECONDS = 24 * 3600
-TEXT_CACHE_EXPIRATION_SECONDS = 6 * 3600
+AI_RESULT_EXPIRATION_SECONDS = 5 * 60
+TEXT_CACHE_EXPIRATION_SECONDS = 5 * 60
 
 # ==================== 初始化配置 ====================
 def setup_logging():
