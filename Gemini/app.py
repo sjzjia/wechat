@@ -42,6 +42,9 @@ UNSAFE_URL_REPLY = "抱歉，检测到图片链接可能存在安全风险，已
 AI_BLOCK_REASON_PREFIX = "抱歉，AI 认为您提问的内容或图片可能存在问题，已被安全策略阻断（原因："
 AI_BLOCK_REASON_SUFFIX = "）。请尝试换一种方式提问或更换图片。"
 NO_REDIS_CONNECTION_REPLY = "抱歉，目前无法连接到结果存储服务，请稍后再试。"
+VOICE_MESSAGE_EMPTY_RESULT_REPLY = "抱歉，语音识别结果为空，请确保语音清晰。"
+VOICE_MESSAGE_PROCESSING_FAILED_REPLY = "抱歉，语音识别失败，请稍后重试或尝试发送文本消息。"
+
 
 # Redis 键前缀和过期时间
 REDIS_USER_AI_RESULT_PREFIX = "wechat_ai_result:"
@@ -75,6 +78,7 @@ GEMINI_IMAGE_TIMEOUT = int(os.environ.get('GEMINI_IMAGE_TIMEOUT', 30)) # Gemini 
 GEMINI_TEXT_TIMEOUT = int(os.environ.get('GEMINI_TEXT_TIMEOUT', 20))   # Gemini 文本回复超时
 WECHAT_ACCESS_TOKEN_TIMEOUT = int(os.environ.get('WECHAT_ACCESS_TOKEN_TIMEOUT', 5)) # 获取微信 AccessToken 超时
 WECHAT_MEDIA_UPLOAD_TIMEOUT = int(os.environ.get('WECHAT_MEDIA_UPLOAD_TIMEOUT', 10)) # 微信媒体上传超时
+WECHAT_VOICE_DOWNLOAD_TIMEOUT = int(os.environ.get('WECHAT_VOICE_DOWNLOAD_TIMEOUT', 10)) # 微信语音下载超时
 IMAGE_DOWNLOAD_TIMEOUT = int(os.environ.get('IMAGE_DOWNLOAD_TIMEOUT', 10)) # 图片下载超时
 DNS_RESOLVE_TIMEOUT = 2 # DNS 解析超时时间
 
@@ -355,6 +359,7 @@ def handle_message():
             return make_response("Invalid XML: Missing MsgType", 400)
         msg_type = msg_type_element.text
 
+        # 确保从这里开始的缩进与上一行 `msg_type = msg_type_element.text` 相同
         from_user_element = xml.find('FromUserName')
         if from_user_element is None or not from_user_element.text:
             logger.error("XML消息中缺少 FromUserName 字段或为空。")
@@ -410,6 +415,25 @@ def handle_message():
             threading.Thread(target=async_process_image, args=(pic_url, from_user, to_user)).start()
 
             return make_response(reply_xml_str, 200, {'Content-Type': 'application/xml'})
+        
+        elif msg_type == 'voice':
+            recognition_element = xml.find('Recognition')
+            # media_id_element = xml.find('MediaId') # 如果需要MediaId，可以在这里获取
+
+            recognition_content = ""
+            if recognition_element is not None and recognition_element.text:
+                recognition_content = recognition_element.text.strip()
+                logger.info(f"接收到语音消息 (已识别内容): {recognition_content[:100]}... for user: {from_user}")
+            else:
+                logger.warning(f"接收到语音消息但未包含 Recognition 字段或内容为空 for user: {from_user}")
+                return build_reply(from_user, to_user, VOICE_MESSAGE_EMPTY_RESULT_REPLY)
+
+            if recognition_content:
+                ai_response_content = process_text_message(recognition_content)
+                return build_reply(from_user, to_user, ai_response_content)
+            else:
+                logger.warning(f"语音识别结果为空，无法处理 for user: {from_user}")
+                return build_reply(from_user, to_user, VOICE_MESSAGE_EMPTY_RESULT_REPLY)
 
         else:
             logger.warning(f"接收到不支持的消息类型: {msg_type} for user: {from_user}")
@@ -737,12 +761,15 @@ def clean_content(content: str, max_bytes: Union[int, None] = None) -> str:
     content = re.sub(r'^[*-]\s*', '', content, flags=re.MULTILINE) # 移除列表标记
 
     processed_lines = []
-    for line in content.split('\n'):
-        stripped_line = line.strip()
-        if not stripped_line:
-            processed_lines.append('') # 保留完全的空行
-        else:
-            processed_lines.append(stripped_line)
+    for paragraph in content.split('\n'):
+        if not paragraph.strip():
+            processed_lines.append('')
+            continue
+
+        # 使用 textwrap 智能断行
+        wrapped = textwrap.wrap(paragraph, width=MAX_IMG_WIDTH // (FONT_SIZE // 2)) # 大致估算字符宽度
+        for line in wrapped:
+            processed_lines.append(line.strip())
 
     content = '\n'.join(processed_lines)
     # 确保没有连续的多个空行，只保留最多两个空行
