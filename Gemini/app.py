@@ -12,13 +12,13 @@ import io
 import traceback
 import re
 from datetime import datetime
-import textwrap # 引入 textwrap 模块
+import textwrap
 import threading
 import redis
 import ipaddress
 from urllib.parse import urlparse, urljoin
 import socket
-from typing import Union # 导入 Union
+from typing import Union
 
 app = Flask(__name__)
 
@@ -50,11 +50,15 @@ AI_RESULT_EXPIRATION_SECONDS = 5 * 60  # 图片识别结果缓存时间
 TEXT_CACHE_EXPIRATION_SECONDS = 5 * 60  # 文本回复缓存时间
 
 # AI 模型配置参数 (可从环境变量配置)
+GEMINI_TEMPERATURE = float(os.environ.get('GEMINI_TEMPERATURE', 0.7))
+GEMINI_TOP_P = float(os.environ.get('GEMINI_TOP_P', 0.9))
+GEMINI_TOP_K = int(os.environ.get('GEMINI_TOP_K', 40))
+GEMINI_MAX_OUTPUT_TOKENS = int(os.environ.get('GEMINI_MAX_OUTPUT_TOKENS', 8192))
 GEMINI_GENERATION_CONFIG = genai.types.GenerationConfig(
-    temperature=float(os.environ.get('GEMINI_TEMPERATURE', 0.7)),
-    top_p=float(os.environ.get('GEMINI_TOP_P', 0.9)),
-    top_k=int(os.environ.get('GEMINI_TOP_K', 40)),
-    max_output_tokens=int(os.environ.get('GEMINI_MAX_OUTPUT_TOKENS', 8192))
+    temperature=GEMINI_TEMPERATURE,
+    top_p=GEMINI_TOP_P,
+    top_k=GEMINI_TOP_K,
+    max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS
 )
 
 # 图片下载限制 (软限制，字节)
@@ -72,9 +76,14 @@ GEMINI_TEXT_TIMEOUT = int(os.environ.get('GEMINI_TEXT_TIMEOUT', 20))   # Gemini 
 WECHAT_ACCESS_TOKEN_TIMEOUT = int(os.environ.get('WECHAT_ACCESS_TOKEN_TIMEOUT', 5)) # 获取微信 AccessToken 超时
 WECHAT_MEDIA_UPLOAD_TIMEOUT = int(os.environ.get('WECHAT_MEDIA_UPLOAD_TIMEOUT', 10)) # 微信媒体上传超时
 IMAGE_DOWNLOAD_TIMEOUT = int(os.environ.get('IMAGE_DOWNLOAD_TIMEOUT', 10)) # 图片下载超时
+DNS_RESOLVE_TIMEOUT = 2 # DNS 解析超时时间
 
 # 文本转图片限制
+MAX_IMG_WIDTH = 600 # 生成图片的最大宽度
 MAX_IMG_HEIGHT = 4000 # 生成图片的最大高度，防止生成超大图片
+FONT_SIZE = 24
+LINE_SPACING_FACTOR = 0.5 # 行间距与字体大小的比例
+IMAGE_PADDING = 30 # 图片内边距
 
 # ==================== 初始化配置 ====================
 def setup_logging():
@@ -82,20 +91,16 @@ def setup_logging():
     log_format = '%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s'
     log_datefmt = '%Y-%m-%d %H:%M:%S'
 
-    # 使用 __name__ 获取当前模块的 logger
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.DEBUG)
 
-    # 避免重复添加 handlers
     if not logger.handlers:
-        # 控制台输出
         console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)  # 生产环境建议 INFO 或 WARNING
+        console_handler.setLevel(logging.INFO)
         console_formatter = logging.Formatter(log_format, datefmt=log_datefmt)
         console_handler.setFormatter(console_formatter)
         logger.addHandler(console_handler)
 
-        # 文件输出（每天轮换）
         file_handler = logging.FileHandler(
             filename=f'wechat_gemini_{datetime.now().strftime("%Y%m%d")}.log',
             encoding='utf-8',
@@ -132,20 +137,17 @@ GEMINI_API_KEY = os.environ['GEMINI_API_KEY']
 APPID = os.environ['WECHAT_APPID']
 APPSECRET = os.environ['WECHAT_APPSECRET']
 
-# FONT_PATH: 优先从环境变量获取，如果不存在则使用默认值
 FONT_PATH = os.environ.get('FONT_PATH', './SourceHanSansSC-Regular.otf')
 
 if not os.path.exists(FONT_PATH):
     logger.critical(f"字体文件不存在: {FONT_PATH}，请确保已下载并放置在应用根目录或设置正确的路径。")
-    # 如果字体文件不存在，尝试使用 Pillow 的默认字体，这可能会导致中文显示问题，但至少能运行
     try:
         ImageFont.load_default()
         logger.warning("字体文件未找到，将使用 Pillow 默认字体，中文显示可能不正常。")
-        FONT_PATH = None # 设置为 None 表示使用默认字体
+        FONT_PATH = None
     except Exception as e:
         logger.critical(f"加载默认字体也失败: {e}")
         raise FileNotFoundError(f"字体文件不存在: {FONT_PATH} 且无法加载默认字体。")
-
 
 try:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -176,7 +178,7 @@ try:
         socket_timeout=REDIS_SOCKET_TIMEOUT,
         decode_responses=True,
         health_check_interval=REDIS_HEALTH_CHECK_INTERVAL,
-        retry_on_timeout=True # 增强重试机制
+        retry_on_timeout=True
     )
     redis_client = redis.Redis(connection_pool=REDIS_CONNECTION_POOL)
     redis_client.ping()
@@ -209,13 +211,13 @@ def get_access_token() -> Union[str, None]:
     try:
         url = f"https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid={APPID}&secret={APPSECRET}"
         resp = requests.get(url, timeout=WECHAT_ACCESS_TOKEN_TIMEOUT)
-        resp.raise_for_status() # 检查 HTTP 状态码
+        resp.raise_for_status()
         data = resp.json()
 
         if 'access_token' in data:
             with token_lock:
                 access_token_cache["token"] = data['access_token']
-                expires_in = data.get('expires_in', 7200) # 默认 7200 秒
+                expires_in = data.get('expires_in', 7200)
                 access_token_cache["expires_at"] = now + expires_in
             duration = time.time() - start_time
             logger.info(f"获取access_token成功，耗时: {duration:.2f}秒，有效期: {expires_in}秒，下次刷新时间: {datetime.fromtimestamp(access_token_cache['expires_at']-60)}")
@@ -245,7 +247,6 @@ def verify_wechat_config() -> bool:
     logger.info("微信配置验证通过。")
     return True
 
-# 服务启动前进行微信配置验证
 if not verify_wechat_config():
     raise RuntimeError("微信配置验证失败，服务无法启动。请检查环境变量和网络。")
 
@@ -258,8 +259,6 @@ def is_private_ip(ip_str: str) -> bool:
     """
     try:
         ip = ipaddress.ip_address(ip_str)
-        # 检查是否是私有 IP (RFC1918)、回环 IP、链路本地 IP、多播 IP、保留 IP
-        # ipaddress 库的这些属性已经覆盖了大部分不安全的IP范围
         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
             return True
         # 额外检查一些可能不在上述属性中的特殊保留地址，如 0.0.0.0/8
@@ -267,23 +266,12 @@ def is_private_ip(ip_str: str) -> bool:
             return True
         return False
     except ValueError:
-        # 如果 ip_str 不是一个有效的 IP 地址格式，则认为不是私有 IP (或无法判断)
         logger.debug(f"IP地址格式无效，跳过私有IP检查: {ip_str}")
         return False
 
-def is_safe_url(url: str, dns_timeout: int = 2) -> bool:
+def is_safe_url(url: str, dns_timeout: int = DNS_RESOLVE_TIMEOUT) -> bool:
     """
     增强版检查 URL 是否安全，以防范 SSRF 攻击，包括 DNS 解析结果检查。
-
-    参数:
-    url (str): 要检查的 URL。
-    dns_timeout (int): DNS 解析的超时时间（秒）。
-
-    检查项：
-    1. 协议必须是 HTTP 或 HTTPS。
-    2. 主机名必须存在。
-    3. 端口必须是标准端口（80, 443）或未指定。
-    4. 对主机名进行 DNS 解析，确保所有解析到的 IP 地址不属于私有网络或特殊用途IP。
     """
     if not url:
         logger.warning("URL为空，拒绝处理。")
@@ -292,23 +280,18 @@ def is_safe_url(url: str, dns_timeout: int = 2) -> bool:
     try:
         parsed_url = urlparse(url)
 
-        # 1. 协议检查
         if parsed_url.scheme not in ('http', 'https'):
             logger.warning(f"不安全的URL协议: {parsed_url.scheme} for URL: {url[:100]}...")
             return False
 
-        # 2. 主机名检查
         if not parsed_url.hostname:
             logger.warning(f"URL缺少主机名: {url[:100]}...")
             return False
 
-        # 3. 端口检查 (可选，但推荐)
-        # 如果端口指定了，必须是 80 或 443
         if parsed_url.port is not None and parsed_url.port not in (80, 443):
             logger.warning(f"非标准或不安全的URL端口: {parsed_url.port} for URL: {url[:100]}...")
             return False
 
-        # 4. IP 地址检查 (核心 SSRF 防范)
         original_timeout = socket.getdefaulttimeout()
         socket.setdefaulttimeout(dns_timeout)
 
@@ -322,17 +305,16 @@ def is_safe_url(url: str, dns_timeout: int = 2) -> bool:
                     return False
                 resolved_ips.add(parsed_url.hostname)
             else:
-                # 对于域名，进行 DNS 解析
                 addr_info = socket.getaddrinfo(
                     parsed_url.hostname,
                     parsed_url.port if parsed_url.port else parsed_url.scheme,
-                    socket.AF_UNSPEC, # 接受 IPv4 和 IPv6
+                    socket.AF_UNSPEC,
                     socket.SOCK_STREAM
                 )
 
                 for info in addr_info:
                     ip_address = info[4][0]
-                    if ip_address not in resolved_ips:
+                    if ip_address not in resolved_ips: # 避免重复检查同一IP
                         resolved_ips.add(ip_address)
                         if is_private_ip(ip_address):
                             logger.warning(f"URL主机名 '{parsed_url.hostname}' 解析到私有IP地址: {ip_address} for URL: {url[:100]}...")
@@ -345,7 +327,7 @@ def is_safe_url(url: str, dns_timeout: int = 2) -> bool:
             logger.warning(f"DNS解析失败 for hostname: {parsed_url.hostname}, Error: {e} for URL: {url[:100]}...")
             return False
         finally:
-            socket.setdefaulttimeout(original_timeout) # 恢复默认的 socket 超时设置
+            socket.setdefaulttimeout(original_timeout)
 
         if not resolved_ips:
             logger.warning(f"URL主机名 '{parsed_url.hostname}' 无法解析到任何IP地址 for URL: {url[:100]}...")
@@ -355,7 +337,6 @@ def is_safe_url(url: str, dns_timeout: int = 2) -> bool:
     except Exception as e:
         logger.error(f"URL安全检查过程中发生异常: {e}\n{traceback.format_exc()} for URL: {url[:100]}...")
         return False
-
 
 # ==================== 消息处理接口 ====================
 @app.route('/', methods=['POST'])
@@ -409,10 +390,8 @@ def handle_message():
                 return build_reply(from_user, to_user, "抱歉，收到的图片消息格式不完整。")
             pic_url = pic_url_element.text
 
-            # SSRF 防范增强：对 PicUrl 进行安全检查
             if not is_safe_url(pic_url):
                 logger.warning(f"检测到不安全的图片URL，拒绝处理: {pic_url[:100]}... for user: {from_user}")
-                # 记录错误信息到 Redis，以便用户查询时给出具体原因
                 redis_client.set(f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}",
                                   f"{int(time.time())}|ERROR:{UNSAFE_URL_REPLY}",
                                   ex=AI_RESULT_EXPIRATION_SECONDS)
@@ -428,7 +407,6 @@ def handle_message():
                 <Content><![CDATA[{INITIAL_IMAGE_PROCESSING_MESSAGE}]]></Content>
             </xml>"""
 
-            # 使用线程处理图片，避免阻塞主进程
             threading.Thread(target=async_process_image, args=(pic_url, from_user, to_user)).start()
 
             return make_response(reply_xml_str, 200, {'Content-Type': 'application/xml'})
@@ -463,24 +441,20 @@ def async_process_image(pic_url: str, from_user: str, to_user: str):
         image_data = None
 
         try:
-            # SSRF 防护增强：禁用自动重定向，手动检查 Location 头
             image_resp = requests.get(pic_url, timeout=IMAGE_DOWNLOAD_TIMEOUT, headers=headers, stream=True, allow_redirects=False)
             image_resp.raise_for_status()
 
-            # 检查并处理重定向
             if image_resp.status_code in (301, 302, 303, 307, 308):
                 redirect_url = image_resp.headers.get('Location')
                 if redirect_url:
-                    # 将相对路径转换为绝对路径
                     redirect_url = urljoin(pic_url, redirect_url)
-                    if not is_safe_url(redirect_url): # 对重定向后的URL进行SSRF检查
+                    if not is_safe_url(redirect_url):
                         logger.warning(f"检测到不安全的图片URL重定向，拒绝处理: {pic_url[:50]}... -> {redirect_url[:50]}... for user: {from_user}")
                         redis_client.set(f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}", f"{int(time.time())}|ERROR:{UNSAFE_URL_REPLY}", ex=AI_RESULT_EXPIRATION_SECONDS)
                         image_resp.close()
                         return
                     logger.info(f"图片URL重定向到安全地址: {pic_url[:50]}... -> {redirect_url[:50]}... for user: {from_user}")
-                    # 重新请求重定向后的URL
-                    image_resp.close() # 关闭之前的连接
+                    image_resp.close()
                     image_resp = requests.get(redirect_url, timeout=IMAGE_DOWNLOAD_TIMEOUT, headers=headers, stream=True)
                     image_resp.raise_for_status()
                 else:
@@ -489,7 +463,6 @@ def async_process_image(pic_url: str, from_user: str, to_user: str):
                     image_resp.close()
                     return
 
-            # 读取内容并限制大小
             downloaded_size = 0
             image_bytes_buffer = io.BytesIO()
             for chunk in image_resp.iter_content(chunk_size=8192):
@@ -502,12 +475,12 @@ def async_process_image(pic_url: str, from_user: str, to_user: str):
                         return
                     image_bytes_buffer.write(chunk)
             image_data = image_bytes_buffer.getvalue()
-            image_resp.close() # 确保关闭连接
+            image_resp.close()
 
             if not image_data:
                  raise ValueError("下载的图片数据为空。")
 
-            logger.info(f"后台图片下载完成，耗时: {time.time()-start_download_time:.2f}秒，大小: {len(image_data)/1024:.2f}KB")
+            logger.info(f"后台图片下载完成，耗时: {time.time()-start_download_time:.2f}秒，大小: {len(image_data)/1024:.2f}KB。")
         except requests.exceptions.Timeout:
             logger.error(f"后台图片下载超时 for user {from_user} (URL 头部: {pic_url[:50]}...): 请求超时")
             redis_client.set(f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}", f"{int(time.time())}|ERROR:{IMAGE_DOWNLOAD_FAILED_REPLY} (下载超时)", ex=AI_RESULT_EXPIRATION_SECONDS)
@@ -580,7 +553,6 @@ def query_image_result(from_user: str, to_user: str) -> requests.Response:
             else:
                 content_to_reply = f"这是您最近一次图片识别的结果（{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))}）:\n\n{content}"
                 logger.info(f"为用户 {from_user} 返回存储在 Redis 中的图片识别结果。")
-            # 清除已查询的结果，避免重复查询或查询到旧结果
             try:
                 redis_client.delete(redis_key)
                 logger.debug(f"已清除用户 {from_user} 的 Redis 图片结果缓存 (key: {redis_key})。")
@@ -601,7 +573,6 @@ def process_text_message(content: str) -> str:
     """
     logger.info(f"调用 Gemini 处理文本: {content[:50]}...")
     normalized_content = content.strip().lower()
-    # 使用 MD5 作为缓存键，长度适中，对于缓存键来说足够安全
     cache_key = f"{REDIS_TEXT_CACHE_PREFIX}{hashlib.md5(normalized_content.encode('utf-8')).hexdigest()}"
 
     try:
@@ -611,10 +582,8 @@ def process_text_message(content: str) -> str:
             return cached_answer
     except redis.exceptions.ConnectionError as e:
         logger.warning(f"无法从 Redis 获取文本缓存 (连接错误): {cache_key}, 错误: {e}")
-        # 不中断流程，尝试直接调用 AI
     except Exception as e:
         logger.warning(f"获取文本缓存时发生未知错误: {cache_key}, 错误: {e}\n{traceback.format_exc()}")
-        # 不中断流程，尝试直接调用 AI
 
     try:
         ai_response_content = generate_with_retry(content, is_image_context=False)
@@ -645,14 +614,14 @@ def generate_with_retry(prompt: str, image=None, max_retries: int = 3, is_image_
             start_single_attempt_time = time.time()
             contents = [prompt]
             if image:
-                contents.insert(0, image) # 图片作为第一个元素
+                contents.insert(0, image)
 
             response = gemini_model.generate_content(
                 contents,
                 generation_config=GEMINI_GENERATION_CONFIG,
                 request_options={"timeout": ai_api_request_timeout}
             )
-            # 检查 AI 返回的 BlockReason，提供更详细的错误信息
+            
             if response.prompt_feedback and response.prompt_feedback.block_reason:
                 block_reason = response.prompt_feedback.block_reason.name
                 logger.warning(f"AI 提示被阻断，原因: {block_reason}")
@@ -666,7 +635,7 @@ def generate_with_retry(prompt: str, image=None, max_retries: int = 3, is_image_
             return response.text.strip()
         except Exception as e:
             retry_count += 1
-            wait_time = min(2 ** retry_count, 10) # 指数退避，最大10秒
+            wait_time = min(2 ** retry_count, 10)
             logger.warning(f"AI 生成失败 (尝试 {retry_count}/{max_retries}), 等待 {wait_time:.2f} 秒: {e}\n{traceback.format_exc()}")
             time.sleep(wait_time)
     logger.error("AI 生成失败，已达到最大重试次数。")
@@ -683,11 +652,11 @@ def build_reply(from_user: str, to_user: str, content: str) -> requests.Response
 
         if content_bytes > WECHAT_TEXT_MAX_BYTES:
             logger.info(f"内容过长({content_bytes}字节 > {WECHAT_TEXT_MAX_BYTES}字节)，尝试转换为图片并回复。")
-            img_data = text_to_image(cleaned_content)
+            img_data = text_to_image(cleaned_content, max_width=MAX_IMG_WIDTH, font_size=FONT_SIZE, line_spacing_factor=LINE_SPACING_FACTOR)
             if img_data:
                 if len(img_data) > WECHAT_MAX_IMAGE_UPLOAD_SIZE:
                     logger.warning(f"生成的图片大小 ({len(img_data)/1024:.2f}KB) 超过微信上传限制 ({WECHAT_MAX_IMAGE_UPLOAD_SIZE/1024:.2f}KB)。将回退为截断文本。")
-                    truncated_content = clean_content(cleaned_content, max_bytes=WECHAT_TEXT_MAX_BYTES)
+                    truncated_content = clean_content(cleaned_content, max_bytes=WECHAT_TEXT_MAX_BYTES - len(AI_REPLY_TOO_LONG_IMAGE_FAIL_PREFIX.encode('utf-8'))) # 为前缀预留空间
                     reply_xml_str = f"""<xml>
                         <ToUserName><![CDATA[{from_user}]]></ToUserName>
                         <FromUserName><![CDATA[{to_user}]]></FromUserName>
@@ -708,7 +677,7 @@ def build_reply(from_user: str, to_user: str, content: str) -> requests.Response
                         </xml>"""
                     else:
                         logger.warning("图片上传至微信失败，回退到文本回复并截断。")
-                        truncated_content = clean_content(cleaned_content, max_bytes=WECHAT_TEXT_MAX_BYTES)
+                        truncated_content = clean_content(cleaned_content, max_bytes=WECHAT_TEXT_MAX_BYTES - len(AI_REPLY_TOO_LONG_IMAGE_FAIL_PREFIX.encode('utf-8')))
                         reply_xml_str = f"""<xml>
                             <ToUserName><![CDATA[{from_user}]]></ToUserName>
                             <FromUserName><![CDATA[{to_user}]]></FromUserName>
@@ -718,7 +687,7 @@ def build_reply(from_user: str, to_user: str, content: str) -> requests.Response
                         </xml>"""
             else:
                 logger.warning("文本转换为图片失败，回退到文本回复并截断。")
-                truncated_content = clean_content(cleaned_content, max_bytes=WECHAT_TEXT_MAX_BYTES)
+                truncated_content = clean_content(cleaned_content, max_bytes=WECHAT_TEXT_MAX_BYTES - len(AI_REPLY_TOO_LONG_IMAGE_FAIL_PREFIX.encode('utf-8')))
                 reply_xml_str = f"""<xml>
                     <ToUserName><![CDATA[{from_user}]]></ToUserName>
                     <FromUserName><![CDATA[{to_user}]]></FromUserName>
@@ -757,20 +726,23 @@ def clean_content(content: str, max_bytes: Union[int, None] = None) -> str:
     if not content:
         return ""
     
-    # 移除常见的Markdown标记，但保留换行
-    content = re.sub(r'(\*\*|__|\*|_|`|~~|#+\s*)', '', content)
-    # 移除链接的Markdown格式，只保留链接文本
-    content = re.sub(r'\[([^\]]+?)\]\(.*?\)', r'\1', content)
-    # 移除图片链接的Markdown格式
-    content = re.sub(r'!\[.*?\]\(.*?\)', '', content)
+    # 移除所有Markdown标记，包括但不限于粗体、斜体、删除线、下划线、代码块、引用、列表、链接、图片
+    # 尽可能保留换行，除非是代码块或多行引用等
+    content = re.sub(r'```.*?```', '', content, flags=re.DOTALL) # 移除代码块
+    content = re.sub(r'\|.*?\|', '', content) # 移除表格行
+    content = re.sub(r'(\*\*|__|\*|_|`|~~|#+\s*)', '', content) # 粗体、斜体、删除线、下划线、标题
+    content = re.sub(r'\[([^\]]+?)\]\(.*?\)', r'\1', content) # 链接只保留文本
+    content = re.sub(r'!\[.*?\]\(.*?\)', '', content) # 移除图片链接
+    content = re.sub(r'^>\s*', '', content, flags=re.MULTILINE) # 移除引用标记
+    content = re.sub(r'^[*-]\s*', '', content, flags=re.MULTILINE) # 移除列表标记
 
     processed_lines = []
-    for paragraph in content.split('\n'):
-        # 移除行首尾空格，但保留完全空行
-        if not paragraph.strip():
-            processed_lines.append('')
+    for line in content.split('\n'):
+        stripped_line = line.strip()
+        if not stripped_line:
+            processed_lines.append('') # 保留完全的空行
         else:
-            processed_lines.append(paragraph.strip())
+            processed_lines.append(stripped_line)
 
     content = '\n'.join(processed_lines)
     # 确保没有连续的多个空行，只保留最多两个空行
@@ -778,97 +750,78 @@ def clean_content(content: str, max_bytes: Union[int, None] = None) -> str:
     content = content.strip()
 
     if max_bytes is not None:
-        encoded = content.encode('utf-8')
-        if len(encoded) > max_bytes:
-            logger.warning(f"内容因字节限制被截断: 原始 {len(encoded)} 字节，截断至 {max_bytes} 字节。")
-            # 采用更安全的截断方式，避免截断多字节字符
-            truncated_content = encoded[:max_bytes].decode('utf-8', 'ignore')
-            # 确保截断后不会有不完整的字符或乱码
-            while len(truncated_content.encode('utf-8')) > max_bytes:
-                truncated_content = truncated_content[:-1]
-            return truncated_content
+        encoded_content = content.encode('utf-8')
+        if len(encoded_content) > max_bytes:
+            logger.warning(f"内容因字节限制被截断: 原始 {len(encoded_content)} 字节，截断至 {max_bytes} 字节。")
+            truncated_bytes = encoded_content[:max_bytes]
+            # 找到最后一个完整的UTF-8字符的边界
+            while not truncated_bytes.decode('utf-8', 'ignore').encode('utf-8') == truncated_bytes:
+                truncated_bytes = truncated_bytes[:-1]
+            return truncated_bytes.decode('utf-8', 'ignore')
     return content
 
-def text_to_image(text: str, max_width: int = 600, font_size: int = 24, line_spacing_factor: float = 0.5) -> Union[bytes, None]:
+def text_to_image(text: str, max_width: int = MAX_IMG_WIDTH, font_size: int = FONT_SIZE, line_spacing_factor: float = LINE_SPACING_FACTOR) -> Union[bytes, None]:
     """
     将文本转换为图片。
-    参数:
-    text (str): 要转换的文本。
-    max_width (int): 图片最大宽度。
-    font_size (int): 字体大小。
-    line_spacing_factor (float): 行间距与字体大小的比例。
     """
     try:
         start_time_img_gen = time.time()
-        padding = 30
+        padding = IMAGE_PADDING
         line_spacing = int(font_size * line_spacing_factor)
         
         font = None
         if FONT_PATH:
             font = ImageFont.truetype(FONT_PATH, font_size)
         else:
-            font = ImageFont.load_default() # Fallback to default if FONT_PATH is None
+            font = ImageFont.load_default()
 
         wrapped_lines = []
         max_line_content_width = max_width - 2 * padding
 
-        # 逐段处理文本，确保空行被保留
         for paragraph in text.split('\n'):
             if not paragraph.strip():
-                wrapped_lines.append('') # 保留完全的空行
+                wrapped_lines.append('')
                 continue
 
-            # 使用 textwrap 模块进行智能换行，考虑中文
-            # getlength 适用于 truetype 字体，getbbox 适用于 Pillow 默认字体
-            if FONT_PATH:
-                # 对于非英文字体，getlength 相对准确
-                lines_for_paragraph = []
-                current_line = []
-                current_line_width = 0
-                for char in paragraph:
-                    char_width = font.getlength(char) if current_line else font.getlength(char) # getlength在单个字符时可能不准
-                    if current_line_width + char_width <= max_line_content_width:
-                        current_line.append(char)
-                        current_line_width += char_width
-                    else:
-                        if current_line:
-                            lines_for_paragraph.append("".join(current_line))
-                        current_line = [char]
-                        current_line_width = font.getlength(char)
-                if current_line:
-                    lines_for_paragraph.append("".join(current_line))
-                wrapped_lines.extend(lines_for_paragraph)
-            else:
-                # 对于默认字体，textwrap 结合 getbbox
-                temp_wrapped = textwrap.wrap(paragraph, width=int(max_line_content_width / (font_size * 0.6))) # 粗略估算字符数
-                wrapped_lines.extend(temp_wrapped)
+            current_line_chars = []
+            current_line_width = 0
+            for char in paragraph:
+                # 使用 getbbox 来获取字符的精确宽度，即使是默认字体也能工作
+                # getbbox returns (left, top, right, bottom)
+                char_bbox = font.getbbox(char)
+                char_width = char_bbox[2] - char_bbox[0] # width is right - left
 
+                if current_line_width + char_width <= max_line_content_width:
+                    current_line_chars.append(char)
+                    current_line_width += char_width
+                else:
+                    if current_line_chars:
+                        wrapped_lines.append("".join(current_line_chars))
+                    current_line_chars = [char]
+                    current_line_width = char_width
+            if current_line_chars:
+                wrapped_lines.append("".join(current_line_chars))
 
         if not wrapped_lines:
-            wrapped_lines = [""]
+            wrapped_lines = [""] # 确保即使文本为空也有一行
 
-        # 计算图片高度
         line_height = font_size + line_spacing
         img_height = 2 * padding + len(wrapped_lines) * line_height
 
-        # 确保图片高度不会过大，防止生成超大图
         if img_height > MAX_IMG_HEIGHT:
             logger.warning(f"图片高度超过限制 {MAX_IMG_HEIGHT}px，原始高度 {img_height}px，将截断内容。")
-            # 重新计算能容纳的行数
-            displayable_lines = int((MAX_IMG_HEIGHT - 2 * padding) / line_height) - 2 # 预留两行给提示信息
+            displayable_lines = int((MAX_IMG_HEIGHT - 2 * padding) / line_height) - 2
             
             if displayable_lines < 0:
-                displayable_lines = 0 # 极端情况，至少显示空白图片
+                displayable_lines = 0
             
             wrapped_lines = wrapped_lines[:displayable_lines]
             
-            # 添加提示信息
-            if len(wrapped_lines) > 0: # 只有当还有内容时才加提示
-                wrapped_lines.append("...") # 添加省略号表示内容被截断
+            if len(wrapped_lines) > 0 or displayable_lines == 0: # 即使完全截断也加提示
+                wrapped_lines.append("...")
                 wrapped_lines.append("(内容过长，已截断)")
             
-            img_height = 2 * padding + len(wrapped_lines) * line_height # 重新计算高度
-
+            img_height = 2 * padding + len(wrapped_lines) * line_height
 
         img = Image.new("RGB", (max_width, img_height), (255, 255, 255))
         draw = ImageDraw.Draw(img)
@@ -883,23 +836,24 @@ def text_to_image(text: str, max_width: int = 600, font_size: int = 24, line_spa
         if FONT_PATH:
             watermark_font = ImageFont.truetype(FONT_PATH, int(font_size * 0.8))
         else:
-            watermark_font = ImageFont.load_default() # Fallback
+            watermark_font = ImageFont.load_default()
 
-        # getbbox 返回 (left, top, right, bottom)
-        watermark_bbox = draw.textbbox((0, 0), watermark, font=watermark_font)
-        watermark_width = watermark_bbox[2] - watermark_bbox[0]
-        watermark_height = watermark_bbox[3] - watermark_bbox[1]
+        # 确保图片有足够的空间绘制水印
+        if img.height >= (watermark_font.getbbox(watermark)[3] - watermark_font.getbbox(watermark)[1] + 20):
+            watermark_bbox = draw.textbbox((0, 0), watermark, font=watermark_font)
+            watermark_width = watermark_bbox[2] - watermark_bbox[0]
+            watermark_height = watermark_bbox[3] - watermark_bbox[1]
 
-        draw.text(
-            (max_width - watermark_width - 15, img_height - watermark_height - 10),
-            watermark,
-            font=watermark_font,
-            fill=(200, 200, 200)
-        )
+            draw.text(
+                (max_width - watermark_width - 15, img_height - watermark_height - 10),
+                watermark,
+                font=watermark_font,
+                fill=(200, 200, 200)
+            )
 
         output = io.BytesIO()
-        img.save(output, format='PNG', optimize=True, quality=85) # 适当降低质量
-        logger.info(f"文本转图片耗时: {time.time()-start_time_img_gen:.2f}秒，图片大小: {len(output.getvalue())/1024:.2f}KB")
+        img.save(output, format='PNG', optimize=True, quality=85)
+        logger.info(f"文本转图片耗时: {time.time()-start_time_img_gen:.2f}秒，图片大小: {len(output.getvalue())/1024:.2f}KB。")
         return output.getvalue()
     except Exception as e:
         logger.error(f"文本转换为图片失败: {e}\n{traceback.format_exc()}")
@@ -917,7 +871,6 @@ def upload_image_to_wechat(image_bytes: bytes) -> Union[str, None]:
         logger.error("上传图片失败: 图片数据为空。")
         return None
     
-    # 再次检查图片大小，确保不超过微信上传限制
     if len(image_bytes) > WECHAT_MAX_IMAGE_UPLOAD_SIZE:
         logger.error(f"上传图片失败: 图片大小 ({len(image_bytes)/1024:.2f}KB) 超过微信上传限制 ({WECHAT_MAX_IMAGE_UPLOAD_SIZE/1024:.2f}KB)。")
         return None
