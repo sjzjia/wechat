@@ -44,6 +44,7 @@ AI_BLOCK_REASON_SUFFIX = "）。请尝试换一种方式提问或更换图片。
 NO_REDIS_CONNECTION_REPLY = "抱歉，目前无法连接到结果存储服务，请稍后再试。"
 VOICE_MESSAGE_EMPTY_RESULT_REPLY = "抱歉，语音识别结果为空，请确保语音清晰。"
 VOICE_MESSAGE_PROCESSING_FAILED_REPLY = "抱歉，语音识别失败，请稍后重试或尝试发送文本消息。"
+WELCOME_MESSAGE_REPLY = "欢迎关注！我是AI助手，您可以向我提问或发送图片让我识别。发送“查询图片结果”来获取图片识别结果。"
 
 
 # Redis 键前缀和过期时间
@@ -359,15 +360,14 @@ def handle_message():
             return make_response("Invalid XML: Missing MsgType", 400)
         msg_type = msg_type_element.text
 
-        # 确保从这里开始的缩进与上一行 `msg_type = msg_type_element.text` 相同
         from_user_element = xml.find('FromUserName')
-        if from_user_element is None or not from_user_element.text:
+        if from_user_element is None or not from_user_element.text: # 修正 === 为 is None
             logger.error("XML消息中缺少 FromUserName 字段或为空。")
             return make_response("Invalid XML: Missing FromUserName", 400)
         from_user = from_user_element.text
 
         to_user_element = xml.find('ToUserName')
-        if to_user_element is None or not to_user_element.text:
+        if to_user_element is None or not to_user_element.text: # 修正 === 为 is None
             logger.error("XML消息中缺少 ToUserName 字段或为空。")
             return make_response("Invalid XML: Missing ToUserName", 400)
         to_user = to_user_element.text
@@ -434,6 +434,27 @@ def handle_message():
             else:
                 logger.warning(f"语音识别结果为空，无法处理 for user: {from_user}")
                 return build_reply(from_user, to_user, VOICE_MESSAGE_EMPTY_RESULT_REPLY)
+
+        elif msg_type == 'event': # 新增事件处理
+            event_element = xml.find('Event')
+            if event_element is None or not event_element.text:
+                logger.error(f"事件消息中缺少 Event 字段或为空 for user: {from_user}")
+                logger.warning(f"接收到不支持的事件消息类型 (Event字段缺失): {msg_type} for user: {from_user}")
+                return build_reply(from_user, to_user, UNSUPPORTED_MESSAGE_TYPE_REPLY)
+
+            event_type = event_element.text
+            logger.info(f"接收到事件消息: {event_type} for user: {from_user}")
+
+            if event_type == 'subscribe':
+                logger.info(f"用户 {from_user} 关注了公众号。")
+                return build_reply(from_user, to_user, WELCOME_MESSAGE_REPLY)
+            elif event_type == 'unsubscribe':
+                logger.info(f"用户 {from_user} 取消关注了公众号。")
+                return make_response("", 200) # 取消关注事件不需要回复
+
+            else:
+                logger.warning(f"接收到未处理的事件类型: {event_type} for user: {from_user}")
+                return build_reply(from_user, to_user, UNSUPPORTED_MESSAGE_TYPE_REPLY)
 
         else:
             logger.warning(f"接收到不支持的消息类型: {msg_type} for user: {from_user}")
