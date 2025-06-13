@@ -16,22 +16,6 @@
 - **URL 安全检查**:对用户发送的图片链接进行基本的安全检查，防止 SSRF 攻击。
 - **依赖管理**:提供 `requirements.txt` 文件，方便快速部署。
 
-## 项目结构
-
-```
-Gemini/
-├── app.py                   # Flask 应用主文件，处理微信消息路由和核心逻辑
-├── config.py                # 应用配置，包括日志、环境变量、AI和Redis初始化
-├── constants.py             # 存放应用中使用的常量字符串
-├── utils.py                 # 通用工具函数模块
-├── wechat_handler.py        # 封装微信相关操作，如签名验证、消息解析/构建、素材管理
-├── ai_handler.py            # 封装 AI 模型交互逻辑
-├── redis_handler.py         # 封装 Redis 缓存操作
-├── requirements.txt         # Python 依赖包列表
-├── SourceHanSansSC-Regular.otf # (可选) 思源黑体字体文件，用于文本转图片
-├── .env.example             # (可选) 环境变量示例文件
-└── README.md                # 项目说明文件
-```
 
 ## 环境准备与部署
 
