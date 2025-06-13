@@ -1,4 +1,0 @@
-example.com:443 {
-    reverse_proxy gemini:80  # 将流量代理到内部服务
-    tls 邮箱地址
-}
