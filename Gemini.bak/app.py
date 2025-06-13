@@ -19,6 +19,8 @@ import ipaddress
 from urllib.parse import urlparse, urljoin
 import socket
 from typing import Union
+import json
+from pythonjsonlogger import jsonlogger # 新增导入
 
 app = Flask(__name__)
 
@@ -44,7 +46,7 @@ AI_BLOCK_REASON_SUFFIX = "）。请尝试换一种方式提问或更换图片。
 NO_REDIS_CONNECTION_REPLY = "抱歉，目前无法连接到结果存储服务，请稍后再试。"
 VOICE_MESSAGE_EMPTY_RESULT_REPLY = "抱歉，语音识别结果为空，请确保语音清晰。"
 VOICE_MESSAGE_PROCESSING_FAILED_REPLY = "抱歉，语音识别失败，请稍后重试或尝试发送文本消息。"
-WELCOME_MESSAGE_REPLY = "欢迎关注！我是AI助手，您可以向我提问或发送图片让我识别。发送“查询图片结果”来获取图片识别结果。"
+WELCOME_MESSAGE_REPLY = "欢迎关注！我是AI助手，您可以向我提问或发送图片让我识别。"
 
 
 # Redis 键前缀和过期时间
@@ -92,28 +94,33 @@ IMAGE_PADDING = 30 # 图片内边距
 
 # ==================== 初始化配置 ====================
 def setup_logging():
-    """配置详细的日志记录系统"""
-    log_format = '%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s'
-    log_datefmt = '%Y-%m-%d %H:%M:%S'
+    """配置详细的日志记录系统，输出为 JSON 格式"""
+    # 定义 JSON 格式的日志字段
+    # 注意：fields 顺序决定了 JSON 中键的顺序，但实际中顺序可能不严格保证
+    log_format = '%(asctime)s %(levelname)s %(filename)s:%(lineno)d %(message)s'
 
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.DEBUG)
 
     if not logger.handlers:
+        # 控制台输出 handler
         console_handler = logging.StreamHandler()
         console_handler.setLevel(logging.INFO)
-        console_formatter = logging.Formatter(log_format, datefmt=log_datefmt)
-        console_handler.setFormatter(console_formatter)
+        # 使用 JsonFormatter
+        formatter = jsonlogger.JsonFormatter(log_format,
+                                             rename_fields={'levelname': 'level', 'asctime': 'timestamp', 'filename': 'file', 'lineno': 'line'},
+                                             json_ensure_ascii=False) # 确保中文不会被转义
+        console_handler.setFormatter(formatter)
         logger.addHandler(console_handler)
 
+        # 文件输出 handler
         file_handler = logging.FileHandler(
             filename=f'wechat_gemini_{datetime.now().strftime("%Y%m%d")}.log',
             encoding='utf-8',
             mode='a'
         )
         file_handler.setLevel(logging.DEBUG)
-        file_formatter = logging.Formatter(log_format, datefmt=log_datefmt)
-        file_handler.setFormatter(file_formatter)
+        file_handler.setFormatter(formatter) # 文件输出也使用 JsonFormatter
         logger.addHandler(file_handler)
 
     return logger
