@@ -90,6 +90,4 @@ python app.py
 *   优化性能和资源使用。
 *   添加单元测试和集成测试。
 
-<img width="805" alt="image" src="https://github.com/user-attachments/assets/b77857a6-f0a3-457e-8900-bd5141e045a9" />
-
 
