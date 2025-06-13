@@ -1,231 +1,580 @@
-# -*- coding: utf-8 -*- 
-from typing import Union, Dict, Any, Optional
 import hashlib
 import time
-import requests # 保留，因为 ai_handler 和 wechat_handler 内部可能使用
+import requests
 from flask import Flask, request, make_response
+from defusedxml.ElementTree import fromstring
+from xml.sax.saxutils import escape
+import logging
+import google.generativeai as genai
+import os
+from PIL import Image, ImageDraw, ImageFont
+import io
 import traceback
-import threading # 保留，如果后续有异步处理需求
-import io # 保留，utils 和 ai_handler 中使用
-
-# 导入自定义模块
-from config import logger, WECHAT_TOKEN, WECHAT_MAX_IMAGE_UPLOAD_SIZE, FONT_PATH, MAX_IMG_WIDTH, MAX_IMG_HEIGHT, FONT_SIZE, LINE_SPACING_FACTOR, IMAGE_PADDING
-import constants as C # 使用别名，方便引用常量
-import utils
-import wechat_handler as wx
-import ai_handler as ai
-import redis_handler as cache
+import re
+from datetime import datetime
+import textwrap
+import threading
+import redis
+import ipaddress
+from urllib.parse import urlparse, urljoin
+import socket
+from typing import Union
+import json
+from pythonjsonlogger import jsonlogger # 新增导入
 
 app = Flask(__name__)
 
-# ==================== 微信消息处理核心逻辑 ====================
-@app.route('/', methods=['GET', 'POST'])
-def wechat_interface():
-    """微信公众号消息接口"""
-    if request.method == 'GET':
-        # 微信接入认证
-        signature = request.args.get('signature', '')
-        timestamp = request.args.get('timestamp', '')
-        nonce = request.args.get('nonce', '')
-        echostr = request.args.get('echostr', '')
-        if wx.check_signature(signature, timestamp, nonce):
-            logger.info("微信接入认证成功")
-            return make_response(echostr)
-        else:
-            logger.error("微信接入认证失败")
-            return make_response("认证失败", 403)
-    else:
-        # 处理 POST 请求，即用户发送的消息
-        xml_data = request.data
-        if not xml_data:
-            logger.warning("收到空的 POST 请求")
-            return make_response("Empty request", 400)
+# ==================== 常量定义 ====================
+# 用户命令
+QUERY_IMAGE_RESULT_COMMAND = "查询图片结果"
 
-        msg = wx.parse_message(xml_data)
-        if not msg:
-            logger.error("解析微信消息失败")
-            # 根据微信开发文档，即使解析失败，也应回复空字符串或success
-            return make_response("success") # 或者返回一个通用错误XML
+# 回复消息常量
+INITIAL_IMAGE_PROCESSING_MESSAGE = "图片已收到，AI正在努力识别中，请耐心等待10-20秒后发送“查询图片结果”来获取。[抱拳]"
+UNSUPPORTED_MESSAGE_TYPE_REPLY = "暂不支持该类型的消息，请发送文本或图片。"
+SERVER_INTERNAL_ERROR_REPLY = "服务器内部错误，请稍后重试。"
+AI_SERVICE_UNAVAILABLE_REPLY = "AI 服务暂时不可用，请稍后再试。"
+IMAGE_DOWNLOAD_FAILED_REPLY = "抱歉，图片下载失败，请检查网络或图片链接是否有效，然后重试。"
+IMAGE_PROCESSING_FAILED_REPLY = "抱歉，图片处理失败，请重试。"
+IMAGE_QUERY_NO_RESULT_REPLY = "AI正在努力识别中，或您目前没有待查询的图片识别结果，或者结果已过期。请先发送一张图片让我识别。[抱拳]"
+IMAGE_QUERY_PARSE_ERROR_REPLY = "抱歉，无法解析存储的图片识别结果，请重试或重新发送图片。"
+AI_REPLY_TOO_LONG_IMAGE_FAIL_PREFIX = "AI回复超长，转图片失败。以下为截断内容：\n"
+AI_REPLY_EXCEPTION_REPLY = "AI回复异常，请稍后重试。"
+ACCESS_TOKEN_FETCH_FAILED_REPLY = "抱歉，无法获取微信服务凭证，请联系管理员。"
+UNSAFE_URL_REPLY = "抱歉，检测到图片链接可能存在安全风险，已拒绝处理。"
+AI_BLOCK_REASON_PREFIX = "抱歉，AI 认为您提问的内容或图片可能存在问题，已被安全策略阻断（原因："
+AI_BLOCK_REASON_SUFFIX = "）。请尝试换一种方式提问或更换图片。"
+NO_REDIS_CONNECTION_REPLY = "抱歉，目前无法连接到结果存储服务，请稍后再试。"
+VOICE_MESSAGE_EMPTY_RESULT_REPLY = "抱歉，语音识别结果为空，请确保语音清晰。"
+VOICE_MESSAGE_PROCESSING_FAILED_REPLY = "抱歉，语音识别失败，请稍后重试或尝试发送文本消息。"
+WELCOME_MESSAGE_REPLY = "欢迎关注！我是AI助手，您可以向我提问或发送图片让我识别。"
 
-        msg_type = msg.get('MsgType', '')
-        from_user = msg.get('FromUserName', '')
-        to_user = msg.get('ToUserName', '')
-        content = msg.get('Content', '').strip() if msg_type == 'text' else ''
-        user_id = from_user # 使用 FromUserName 作为用户唯一标识
 
-        logger.info(f"收到用户 [{user_id}] 的 [{msg_type}] 消息。内容/MediaId: {content or msg.get('MediaId') or msg.get('PicUrl')}")
+# Redis 键前缀和过期时间
+REDIS_USER_AI_RESULT_PREFIX = "wechat_ai_result:"
+REDIS_TEXT_CACHE_PREFIX = "wechat_text_cache:"
+AI_RESULT_EXPIRATION_SECONDS = 5 * 60  # 图片识别结果缓存时间
+TEXT_CACHE_EXPIRATION_SECONDS = 5 * 60  # 文本回复缓存时间
 
-        response_xml = handle_message_logic(user_id, msg_type, msg, from_user, to_user, content)
+# AI 模型配置参数 (可从环境变量配置)
+GEMINI_TEMPERATURE = float(os.environ.get('GEMINI_TEMPERATURE', 0.7))
+GEMINI_TOP_P = float(os.environ.get('GEMINI_TOP_P', 0.9))
+GEMINI_TOP_K = int(os.environ.get('GEMINI_TOP_K', 40))
+GEMINI_MAX_OUTPUT_TOKENS = int(os.environ.get('GEMINI_MAX_OUTPUT_TOKENS', 8192))
+GEMINI_GENERATION_CONFIG = genai.types.GenerationConfig(
+    temperature=GEMINI_TEMPERATURE,
+    top_p=GEMINI_TOP_P,
+    top_k=GEMINI_TOP_K,
+    max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS
+)
 
-        logger.info(f"准备回复用户 [{user_id}] XML: {response_xml[:500]}...") # 日志截断，避免过长
-        response = make_response(response_xml)
-        response.content_type = 'application/xml'
-        return response
+# 图片下载限制 (软限制，字节)
+MAX_IMAGE_DOWNLOAD_SIZE = 5 * 1024 * 1024  # 5MB
 
-def handle_message_logic(user_id, msg_type, msg, from_user, to_user, content: str = ''):
-    """根据消息类型处理具体逻辑并返回响应 XML。"""
-    reply_content = ""
-    media_id_for_reply = None
+# 微信图片上传限制 (字节)
+WECHAT_MAX_IMAGE_UPLOAD_SIZE = 2 * 1024 * 1024  # 2MB
 
+# 微信文本消息限制 (字节)
+WECHAT_TEXT_MAX_BYTES = 2000 # 微信文本消息限制 2048 字节，这里取安全线 2000
+
+# API 请求超时时间
+GEMINI_IMAGE_TIMEOUT = int(os.environ.get('GEMINI_IMAGE_TIMEOUT', 30)) # Gemini 图片识别超时
+GEMINI_TEXT_TIMEOUT = int(os.environ.get('GEMINI_TEXT_TIMEOUT', 20))   # Gemini 文本回复超时
+WECHAT_ACCESS_TOKEN_TIMEOUT = int(os.environ.get('WECHAT_ACCESS_TOKEN_TIMEOUT', 5)) # 获取微信 AccessToken 超时
+WECHAT_MEDIA_UPLOAD_TIMEOUT = int(os.environ.get('WECHAT_MEDIA_UPLOAD_TIMEOUT', 10)) # 微信媒体上传超时
+WECHAT_VOICE_DOWNLOAD_TIMEOUT = int(os.environ.get('WECHAT_VOICE_DOWNLOAD_TIMEOUT', 10)) # 微信语音下载超时
+IMAGE_DOWNLOAD_TIMEOUT = int(os.environ.get('IMAGE_DOWNLOAD_TIMEOUT', 10)) # 图片下载超时
+DNS_RESOLVE_TIMEOUT = 2 # DNS 解析超时时间
+
+# 文本转图片限制
+MAX_IMG_WIDTH = 600 # 生成图片的最大宽度
+MAX_IMG_HEIGHT = 4000 # 生成图片的最大高度，防止生成超大图片
+FONT_SIZE = 24
+LINE_SPACING_FACTOR = 0.5 # 行间距与字体大小的比例
+IMAGE_PADDING = 30 # 图片内边距
+
+# ==================== 初始化配置 ====================
+def setup_logging():
+    """配置详细的日志记录系统，输出为 JSON 格式"""
+    # 定义 JSON 格式的日志字段
+    # 注意：fields 顺序决定了 JSON 中键的顺序，但实际中顺序可能不严格保证
+    log_format = '%(asctime)s %(levelname)s %(filename)s:%(lineno)d %(message)s'
+
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.DEBUG)
+
+    if not logger.handlers:
+        # 控制台输出 handler
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        # 使用 JsonFormatter
+        formatter = jsonlogger.JsonFormatter(log_format,
+                                             rename_fields={'levelname': 'level', 'asctime': 'timestamp', 'filename': 'file', 'lineno': 'line'},
+                                             json_ensure_ascii=False) # 确保中文不会被转义
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+
+        # 文件输出 handler
+        file_handler = logging.FileHandler(
+            filename=f'wechat_gemini_{datetime.now().strftime("%Y%m%d")}.log',
+            encoding='utf-8',
+            mode='a'
+        )
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(formatter) # 文件输出也使用 JsonFormatter
+        logger.addHandler(file_handler)
+
+    return logger
+
+logger = setup_logging()
+
+# 环境变量校验
+REQUIRED_ENV_VARS = {
+    'WECHAT_TOKEN': '微信Token',
+    'GEMINI_API_KEY': 'Gemini API密钥',
+    'WECHAT_APPID': '微信APPID',
+    'WECHAT_APPSECRET': '微信APPSECRET',
+    'REDIS_HOST': 'Redis主机地址',
+    'REDIS_PORT': 'Redis端口',
+}
+
+missing_vars = [name for name in REQUIRED_ENV_VARS if not os.environ.get(name)]
+if missing_vars:
+    error_msg = f"缺少必要环境变量: {', '.join([f'{v} ({REQUIRED_ENV_VARS[v]})' for v in missing_vars])}"
+    logger.critical(error_msg)
+    raise EnvironmentError(error_msg)
+
+# 初始化配置
+WECHAT_TOKEN = os.environ['WECHAT_TOKEN']
+GEMINI_API_KEY = os.environ['GEMINI_API_KEY']
+APPID = os.environ['WECHAT_APPID']
+APPSECRET = os.environ['WECHAT_APPSECRET']
+
+FONT_PATH = os.environ.get('FONT_PATH', './SourceHanSansSC-Regular.otf')
+
+if not os.path.exists(FONT_PATH):
+    logger.critical(f"字体文件不存在: {FONT_PATH}，请确保已下载并放置在应用根目录或设置正确的路径。")
     try:
-        if msg_type == 'text':
-            # 检查是否为查询图片结果的命令
-            if content == C.QUERY_IMAGE_RESULT_COMMAND:
-                ai_result = cache.get_ai_result(user_id)
-                if ai_result and "text" in ai_result:
-                    reply_content = ai_result["text"]
-                    # 成功查询后，可以选择删除该结果，避免重复查询
-                    cache.delete_ai_result(user_id)
-                elif ai_result and "error" in ai_result:
-                    reply_content = ai_result["error"]
-                else:
-                    reply_content = C.IMAGE_QUERY_NO_RESULT_REPLY
-            else:
-                # 检查是否有缓存的文本回复
-                request_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
-                cached_reply = cache.get_cached_text_reply(user_id, request_hash)
-                if cached_reply:
-                    reply_content = cached_reply
-                    logger.info(f"命中用户 [{user_id}] 的文本请求缓存。")
-                else:
-                    # 调用 AI 生成文本回复
-                    reply_content = ai.generate_text_from_text(content, user_id=user_id)
-                    if not reply_content.startswith(C.AI_BLOCK_REASON_PREFIX): # 仅缓存成功的AI回复
-                        cache.cache_text_reply(user_id, request_hash, reply_content)
-
-        elif msg_type == 'image':
-            pic_url = msg.get('PicUrl')
-            media_id = msg.get('MediaId') # 图片消息会同时有 PicUrl 和 MediaId
-            if pic_url:
-                # 异步处理图片识别，先回复提示信息
-                # 使用 threading 创建一个新线程来处理耗时的 AI 调用
-                # 注意：在某些部署环境（如无状态的 serverless function）中，后台线程可能在主请求结束后被终止
-                # 对于这类环境，需要使用消息队列等更可靠的异步处理机制
-                thread = threading.Thread(target=process_image_async, args=(user_id, pic_url, media_id))
-                thread.start()
-                reply_content = C.INITIAL_IMAGE_PROCESSING_MESSAGE
-            else:
-                reply_content = C.IMAGE_DOWNLOAD_FAILED_REPLY + " (缺少图片链接)"
-
-        elif msg_type == 'voice':
-            media_id = msg.get('MediaId')
-            recognition = msg.get('Recognition', '') # 语音识别结果（如果微信开启了）
-
-            if recognition: # 如果微信已经提供了识别结果
-                logger.info(f"用户 [{user_id}] 语音消息，微信识别结果: {recognition}")
-                reply_content = ai.generate_text_from_text(f"处理以下语音转文本的结果：{recognition}", user_id=user_id)
-            elif media_id:
-                # 下载语音文件并进行处理 (此处假设有语音转文本服务，或直接将 media_id 交给 AI 处理，如果 AI 支持)
-                # 这里简化为提示用户我们收到了语音，实际应用中需要集成语音转文字服务
-                # voice_bytes = wx.download_wechat_media(media_id)
-                # if voice_bytes:
-                #     # text_from_voice = call_voice_to_text_service(voice_bytes)
-                #     # reply_content = ai.generate_text_from_text(text_from_voice)
-                #     reply_content = "语音消息已收到，正在处理中...（功能待实现）"
-                # else:
-                #     reply_content = C.VOICE_MESSAGE_PROCESSING_FAILED_REPLY
-                logger.warning(f"用户 [{user_id}] 发送了语音消息，但未开启微信语音识别，且后端未实现语音处理。Media ID: {media_id}")
-                reply_content = "您的语音已收到。如需AI回复，请开启微信后台的语音识别功能，或稍后尝试发送文本。"
-            else:
-                reply_content = C.VOICE_MESSAGE_PROCESSING_FAILED_REPLY + " (缺少 MediaID)"
-
-        elif msg_type == 'event':
-            event = msg.get('Event', '')
-            if event == 'subscribe':
-                reply_content = C.WELCOME_MESSAGE_REPLY
-            elif event == 'unsubscribe':
-                logger.info(f"用户 [{user_id}] 取消关注")
-                return "success" # 取消关注不需要回复XML
-            # 可以处理其他事件，如点击菜单等
-            else:
-                logger.info(f"收到未处理的事件类型: {event} from user [{user_id}] ")
-                # reply_content = "收到了一个事件，但我不知道怎么处理它。"
-                return "success" # 对于未明确处理的事件，回复 success 让微信不再重试
-
-        else:
-            reply_content = C.UNSUPPORTED_MESSAGE_TYPE_REPLY
-            logger.warning(f"收到不支持的消息类型: {msg_type} from user [{user_id}]")
-
+        ImageFont.load_default()
+        logger.warning("字体文件未找到，将使用 Pillow 默认字体，中文显示可能不正常。")
+        FONT_PATH = None
     except Exception as e:
-        logger.error(f"处理用户 [{user_id}] 消息时发生严重错误: {e}\n{traceback.format_exc()}")
-        reply_content = C.SERVER_INTERNAL_ERROR_REPLY
+        logger.critical(f"加载默认字体也失败: {e}")
+        raise FileNotFoundError(f"字体文件不存在: {FONT_PATH} 且无法加载默认字体。")
 
-    # 统一回复构建
-    if media_id_for_reply:
-        return wx.build_image_response(from_user, to_user, media_id_for_reply)
-    else:
-        # 检查回复内容是否过长，如果过长且是文本，尝试转为图片
-        if len(reply_content.encode('utf-8')) > C.WECHAT_TEXT_MAX_BYTES:
-            logger.info(f"回复用户 [{user_id}] 的文本内容过长 ({len(reply_content.encode('utf-8'))} bytes)，尝试转为图片。")
-            image_bytes = utils.text_to_image_bytes(reply_content)
-            if image_bytes:
-                # 检查图片大小是否超过微信限制
-                if len(image_bytes) > WECHAT_MAX_IMAGE_UPLOAD_SIZE:
-                    logger.warning(f"生成的回复图片大小 ({len(image_bytes)} bytes) 超过微信限制 ({WECHAT_MAX_IMAGE_UPLOAD_SIZE} bytes)。将发送截断的文本。")
-                    # 可以选择发送部分文本，或者一个提示图片超大的文本
-                    # 此处简单发送前缀+截断文本
-                    final_reply_content = C.AI_REPLY_TOO_LONG_IMAGE_FAIL_PREFIX + utils.truncate_text_by_bytes(reply_content, C.WECHAT_TEXT_MAX_BYTES - len(C.AI_REPLY_TOO_LONG_IMAGE_FAIL_PREFIX.encode('utf-8')))
-                    return wx.build_text_response(from_user, to_user, final_reply_content)
+try:
+    genai.configure(api_key=GEMINI_API_KEY)
+    gemini_model = genai.GenerativeModel('gemini-2.0-flash')
+    logger.info("Gemini AI 模型 (gemini-2.0-flash) 初始化成功。")
+except Exception as e:
+    logger.critical(f"Gemini 初始化失败: {str(e)}\n{traceback.format_exc()}")
+    raise RuntimeError("Gemini AI 模型初始化失败，请检查API密钥和网络连接。")
 
-                uploaded_media_id = wx.upload_media_to_wechat('image', image_bytes, filename=f"reply_{user_id}.png")
-                if uploaded_media_id and not uploaded_media_id.startswith("上传媒体文件失败") and not uploaded_media_id.startswith(C.ACCESS_TOKEN_FETCH_FAILED_REPLY):
-                    logger.info(f"成功将超长文本转为图片并上传，Media ID: {uploaded_media_id}，回复给用户 [{user_id}]。")
-                    return wx.build_image_response(from_user, to_user, uploaded_media_id)
-                else:
-                    logger.error(f"超长文本转图片后上传微信失败: {uploaded_media_id}。将回复截断的文本给用户 [{user_id}]。")
-                    # 上传失败，回复截断的文本
-                    final_reply_content = C.AI_REPLY_TOO_LONG_IMAGE_FAIL_PREFIX + utils.truncate_text_by_bytes(reply_content, C.WECHAT_TEXT_MAX_BYTES - len(C.AI_REPLY_TOO_LONG_IMAGE_FAIL_PREFIX.encode('utf-8')))
-                    return wx.build_text_response(from_user, to_user, final_reply_content)
-            else:
-                logger.error(f"超长文本转图片失败。将回复截断的文本给用户 [{user_id}]。")
-                # 转图片也失败，回复截断的文本
-                final_reply_content = C.AI_REPLY_TOO_LONG_IMAGE_FAIL_PREFIX + utils.truncate_text_by_bytes(reply_content, C.WECHAT_TEXT_MAX_BYTES - len(C.AI_REPLY_TOO_LONG_IMAGE_FAIL_PREFIX.encode('utf-8')))
-                return wx.build_text_response(from_user, to_user, final_reply_content)
+# ==================== Redis 配置和连接 ====================
+REDIS_HOST = os.environ.get('REDIS_HOST', 'localhost')
+REDIS_PORT = int(os.environ.get('REDIS_PORT', 6379))
+REDIS_DB = int(os.environ.get('REDIS_DB', 0))
+REDIS_PASSWORD = os.environ.get('REDIS_PASSWORD')
+REDIS_MAX_CONNECTIONS = int(os.environ.get('REDIS_MAX_CONNECTIONS', 20))
+REDIS_CONNECT_TIMEOUT = int(os.environ.get('REDIS_CONNECT_TIMEOUT', 5))
+REDIS_SOCKET_TIMEOUT = int(os.environ.get('REDIS_SOCKET_TIMEOUT', 5))
+REDIS_HEALTH_CHECK_INTERVAL = int(os.environ.get('REDIS_HEALTH_CHECK_INTERVAL', 30))
 
-        return wx.build_text_response(from_user, to_user, reply_content if reply_content else "我现在有点忙，稍后再试吧～")
-
-def process_image_async(user_id: str, pic_url: str, media_id: str):
-    """异步处理图片识别的函数，在单独的线程中运行。"""
-    with app.app_context(): # 确保在 Flask 应用上下文中执行，以便访问 logger 等
-        logger.info(f"开始异步处理用户 [{user_id}] 的图片，URL: {pic_url}, Media ID: {media_id}")
-        # 优先使用 PicUrl，如果 Gemini 处理 URL 有问题，可以考虑下载 MediaId 对应的图片
-        # ai_text_result = ai.generate_text_from_image_url(pic_url, user_id=user_id)
-
-        # 尝试从微信服务器下载图片（可能更稳定，但会消耗token调用次数）
-        image_bytes = wx.download_wechat_media(media_id)
-        if image_bytes:
-            logger.info(f"成功从微信下载用户 [{user_id}] 的图片 (Media ID: {media_id}), 大小: {len(image_bytes)} bytes, 准备提交给 AI。")
-            ai_text_result = ai.generate_text_from_image_bytes(image_bytes, prompt="请用中文详细描述这张图片的内容，并尽可能分析它的含义。请直接给出描述，不要说“这张图片显示了...”之类的引导语。请务必使用中文回复", user_id=user_id)
-        else:
-            logger.warning(f"从微信下载用户 [{user_id}] 的图片 (Media ID: {media_id}) 失败，尝试使用 PicUrl。")
-            ai_text_result = ai.generate_text_from_image_url(pic_url, prompt="请用中文详细描述这张图片的内容，并尽可能分析它的含义。请直接给出描述，不要说“这张图片显示了...”之类的引导语。请务必使用中文回复", user_id=user_id)
-
-        if ai_text_result:
-            # 将结果存储到 Redis，供用户后续查询
-            storage_success = cache.store_ai_result(user_id, {"text": ai_text_result, "source_pic_url": pic_url, "source_media_id": media_id})
-            if storage_success is True: # store_ai_result 成功时返回 True
-                logger.info(f"用户 [{user_id}] 的图片识别结果已成功存入 Redis。")
-            elif isinstance(storage_success, str): # 返回错误消息字符串
-                 logger.error(f"用户 [{user_id}] 的图片识别结果存入 Redis 失败: {storage_success}")
-            else: # 返回 False
-                 logger.error(f"用户 [{user_id}] 的图片识别结果存入 Redis 失败 (未知原因)。")
-        else:
-            # AI 处理失败，也可以考虑存储一个错误标记
-            cache.store_ai_result(user_id, {"error": C.IMAGE_PROCESSING_FAILED_REPLY, "source_pic_url": pic_url, "source_media_id": media_id})
-            logger.error(f"用户 [{user_id}] 的图片 AI 处理失败。")
+try:
+    REDIS_CONNECTION_POOL = redis.ConnectionPool(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        db=REDIS_DB,
+        password=REDIS_PASSWORD,
+        max_connections=REDIS_MAX_CONNECTIONS,
+        socket_connect_timeout=REDIS_CONNECT_TIMEOUT,
+        socket_timeout=REDIS_SOCKET_TIMEOUT,
+        decode_responses=True,
+        health_check_interval=REDIS_HEALTH_CHECK_INTERVAL,
+        retry_on_timeout=True
+    )
+    redis_client = redis.Redis(connection_pool=REDIS_CONNECTION_POOL)
+    redis_client.ping()
+    logger.info(f"成功连接到 Redis 服务器: {REDIS_HOST}:{REDIS_PORT} (DB: {REDIS_DB}, 连接池大小: {REDIS_CONNECTION_POOL.max_connections})")
+except redis.exceptions.ConnectionError as e:
+    logger.critical(f"无法连接到 Redis 服务器: {e}")
+    raise RuntimeError(f"无法连接到 Redis 服务器: {e}")
+except Exception as e:
+    logger.critical(f"Redis 初始化失败: {e}")
+    raise RuntimeError(f"Redis 初始化失败: {e}")
 
 
 # ==================== 核心功能 - Access Token ====================
-# Access token management is now handled in wechat_handler.py
+access_token_cache = {"token": None, "expires_at": 0}
+token_lock = threading.Lock()
+
+def get_access_token() -> Union[str, None]:
+    """
+    获取微信 access_token，使用缓存并支持自动刷新。
+    """
+    now = int(time.time())
+    with token_lock:
+        # 提前一分钟刷新，避免临期失效
+        if access_token_cache["token"] and access_token_cache["expires_at"] > now + 60:
+            logger.debug("使用缓存的access_token。")
+            return access_token_cache["token"]
+
+    logger.info("正在获取新的access_token...")
+    start_time = time.time()
+    try:
+        url = f"https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid={APPID}&secret={APPSECRET}"
+        resp = requests.get(url, timeout=WECHAT_ACCESS_TOKEN_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if 'access_token' in data:
+            with token_lock:
+                access_token_cache["token"] = data['access_token']
+                expires_in = data.get('expires_in', 7200)
+                access_token_cache["expires_at"] = now + expires_in
+            duration = time.time() - start_time
+            logger.info(f"获取access_token成功，耗时: {duration:.2f}秒，有效期: {expires_in}秒，下次刷新时间: {datetime.fromtimestamp(access_token_cache['expires_at']-60)}")
+            return data['access_token']
+
+        logger.error(f"获取access_token失败，微信API返回错误: {data}")
+    except requests.exceptions.Timeout:
+        logger.error(f"获取access_token超时，URL: {url}")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"获取access_token网络请求失败: {e}")
+    except Exception as e:
+        logger.error(f"获取access_token时发生异常: {e}\n{traceback.format_exc()}")
+    return None
+
+def verify_wechat_config() -> bool:
+    """
+    验证微信配置是否正确。
+    """
+    logger.info("开始验证微信配置...")
+    if not all([WECHAT_TOKEN, APPID, APPSECRET]):
+        logger.critical("微信基础配置（WECHAT_TOKEN, APPID, WECHAT_APPSECRET）不完整。")
+        return False
+    token = get_access_token()
+    if not token:
+        logger.critical("无法获取access_token，请检查WECHAT_APPID和WECHAT_APPSECRET是否正确。")
+        return False
+    logger.info("微信配置验证通过。")
+    return True
+
+if not verify_wechat_config():
+    raise RuntimeError("微信配置验证失败，服务无法启动。请检查环境变量和网络。")
 
 # ==================== SSRF 防范辅助函数 (增强版) ====================
-# SSRF protection functions (is_private_ip, is_safe_url) are now in utils.py
 
-# Redundant handle_message function and its route have been removed.
-# All GET (authentication) and POST (message handling) requests to '/' are now handled by wechat_interface.
+def is_private_ip(ip_str: str) -> bool:
+    """
+    检查一个 IP 地址是否属于私有网络范围、回环地址、链路本地地址、多播地址或保留地址。
+    这些地址通常不应该通过外部 URL 访问。
+    """
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+            return True
+        # 额外检查一些可能不在上述属性中的特殊保留地址，如 0.0.0.0/8
+        if ipaddress.ip_network('0.0.0.0/8').overlaps(ipaddress.ip_network(ip)):
+            return True
+        return False
+    except ValueError:
+        logger.debug(f"IP地址格式无效，跳过私有IP检查: {ip_str}")
+        return False
 
+def is_safe_url(url: str, dns_timeout: int = DNS_RESOLVE_TIMEOUT) -> bool:
+    """
+    增强版检查 URL 是否安全，以防范 SSRF 攻击，包括 DNS 解析结果检查。
+    """
+    if not url:
+        logger.warning("URL为空，拒绝处理。")
+        return False
 
+    try:
+        parsed_url = urlparse(url)
 
+        if parsed_url.scheme not in ('http', 'https'):
+            logger.warning(f"不安全的URL协议: {parsed_url.scheme} for URL: {url[:100]}...")
+            return False
+
+        if not parsed_url.hostname:
+            logger.warning(f"URL缺少主机名: {url[:100]}...")
+            return False
+
+        if parsed_url.port is not None and parsed_url.port not in (80, 443):
+            logger.warning(f"非标准或不安全的URL端口: {parsed_url.port} for URL: {url[:100]}...")
+            return False
+
+        original_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(dns_timeout)
+
+        resolved_ips = set()
+        try:
+            # 尝试直接解析主机名，如果它是 IP 地址，直接检查
+            if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", parsed_url.hostname) or \
+               re.match(r"^([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$", parsed_url.hostname): # 简单的IPv6判断
+                if is_private_ip(parsed_url.hostname):
+                    logger.warning(f"URL主机是私有IP地址: {parsed_url.hostname} for URL: {url[:100]}...")
+                    return False
+                resolved_ips.add(parsed_url.hostname)
+            else:
+                addr_info = socket.getaddrinfo(
+                    parsed_url.hostname,
+                    parsed_url.port if parsed_url.port else parsed_url.scheme,
+                    socket.AF_UNSPEC,
+                    socket.SOCK_STREAM
+                )
+
+                for info in addr_info:
+                    ip_address = info[4][0]
+                    if ip_address not in resolved_ips: # 避免重复检查同一IP
+                        resolved_ips.add(ip_address)
+                        if is_private_ip(ip_address):
+                            logger.warning(f"URL主机名 '{parsed_url.hostname}' 解析到私有IP地址: {ip_address} for URL: {url[:100]}...")
+                            return False
+
+        except socket.timeout:
+            logger.warning(f"DNS解析超时 for hostname: {parsed_url.hostname}, URL: {url[:100]}...")
+            return False
+        except socket.gaierror as e:
+            logger.warning(f"DNS解析失败 for hostname: {parsed_url.hostname}, Error: {e} for URL: {url[:100]}...")
+            return False
+        finally:
+            socket.setdefaulttimeout(original_timeout)
+
+        if not resolved_ips:
+            logger.warning(f"URL主机名 '{parsed_url.hostname}' 无法解析到任何IP地址 for URL: {url[:100]}...")
+            return False
+
+        return True
+    except Exception as e:
+        logger.error(f"URL安全检查过程中发生异常: {e}\n{traceback.format_exc()} for URL: {url[:100]}...")
+        return False
+
+# ==================== 消息处理接口 ====================
+@app.route('/', methods=['POST'])
+def handle_message():
+    from_user = ""
+    to_user = ""
+    try:
+        logger.info("收到用户消息 POST 请求。")
+        xml_data = request.data
+        logger.debug(f"原始XML数据: {xml_data.decode('utf-8', errors='ignore')[:500]}...")
+        xml = fromstring(xml_data)
+        
+        msg_type_element = xml.find('MsgType')
+        if msg_type_element is None or not msg_type_element.text:
+            logger.error("XML消息中缺少 MsgType 字段或为空。")
+            return make_response("Invalid XML: Missing MsgType", 400)
+        msg_type = msg_type_element.text
+
+        from_user_element = xml.find('FromUserName')
+        if from_user_element is None or not from_user_element.text: # 修正 === 为 is None
+            logger.error("XML消息中缺少 FromUserName 字段或为空。")
+            return make_response("Invalid XML: Missing FromUserName", 400)
+        from_user = from_user_element.text
+
+        to_user_element = xml.find('ToUserName')
+        if to_user_element is None or not to_user_element.text: # 修正 === 为 is None
+            logger.error("XML消息中缺少 ToUserName 字段或为空。")
+            return make_response("Invalid XML: Missing ToUserName", 400)
+        to_user = to_user_element.text
+
+        logger.info(f"消息类型: {msg_type}, 来自用户: {from_user}, 发送给: {to_user}")
+
+        if msg_type == 'text':
+            content_element = xml.find('Content')
+            if content_element is None or not content_element.text:
+                logger.error(f"文本消息中缺少 Content 字段或为空 for user: {from_user}")
+                return build_reply(from_user, to_user, "抱歉，收到的文本消息内容为空。")
+            content = content_element.text
+            logger.info(f"接收到文本消息: {content[:100]}...")
+
+            if content.strip() == QUERY_IMAGE_RESULT_COMMAND:
+                return query_image_result(from_user, to_user)
+
+            ai_response_content = process_text_message(content)
+            return build_reply(from_user, to_user, ai_response_content)
+
+        elif msg_type == 'image':
+            pic_url_element = xml.find('PicUrl')
+            if pic_url_element is None or not pic_url_element.text:
+                logger.error(f"图片消息中缺少 PicUrl 字段或为空 for user: {from_user}")
+                return build_reply(from_user, to_user, "抱歉，收到的图片消息格式不完整。")
+            pic_url = pic_url_element.text
+
+            if not is_safe_url(pic_url):
+                logger.warning(f"检测到不安全的图片URL，拒绝处理: {pic_url[:100]}... for user: {from_user}")
+                redis_client.set(f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}",
+                                  f"{int(time.time())}|ERROR:{UNSAFE_URL_REPLY}",
+                                  ex=AI_RESULT_EXPIRATION_SECONDS)
+                return build_reply(from_user, to_user, UNSAFE_URL_REPLY)
+
+            logger.info(f"接收到图片消息, URL 头部: {pic_url[:50]}... for user: {from_user}")
+
+            reply_xml_str = f"""<xml>
+                <ToUserName><![CDATA[{from_user}]]></ToUserName>
+                <FromUserName><![CDATA[{to_user}]]></FromUserName>
+                <CreateTime>{int(time.time())}</CreateTime>
+                <MsgType><![CDATA[text]]></MsgType>
+                <Content><![CDATA[{INITIAL_IMAGE_PROCESSING_MESSAGE}]]></Content>
+            </xml>"""
+
+            threading.Thread(target=async_process_image, args=(pic_url, from_user, to_user)).start()
+
+            return make_response(reply_xml_str, 200, {'Content-Type': 'application/xml'})
+        
+        elif msg_type == 'voice':
+            recognition_element = xml.find('Recognition')
+            # media_id_element = xml.find('MediaId') # 如果需要MediaId，可以在这里获取
+
+            recognition_content = ""
+            if recognition_element is not None and recognition_element.text:
+                recognition_content = recognition_element.text.strip()
+                logger.info(f"接收到语音消息 (已识别内容): {recognition_content[:100]}... for user: {from_user}")
+            else:
+                logger.warning(f"接收到语音消息但未包含 Recognition 字段或内容为空 for user: {from_user}")
+                return build_reply(from_user, to_user, VOICE_MESSAGE_EMPTY_RESULT_REPLY)
+
+            if recognition_content:
+                ai_response_content = process_text_message(recognition_content)
+                return build_reply(from_user, to_user, ai_response_content)
+            else:
+                logger.warning(f"语音识别结果为空，无法处理 for user: {from_user}")
+                return build_reply(from_user, to_user, VOICE_MESSAGE_EMPTY_RESULT_REPLY)
+
+        elif msg_type == 'event': # 新增事件处理
+            event_element = xml.find('Event')
+            if event_element is None or not event_element.text:
+                logger.error(f"事件消息中缺少 Event 字段或为空 for user: {from_user}")
+                logger.warning(f"接收到不支持的事件消息类型 (Event字段缺失): {msg_type} for user: {from_user}")
+                return build_reply(from_user, to_user, UNSUPPORTED_MESSAGE_TYPE_REPLY)
+
+            event_type = event_element.text
+            logger.info(f"接收到事件消息: {event_type} for user: {from_user}")
+
+            if event_type == 'subscribe':
+                logger.info(f"用户 {from_user} 关注了公众号。")
+                return build_reply(from_user, to_user, WELCOME_MESSAGE_REPLY)
+            elif event_type == 'unsubscribe':
+                logger.info(f"用户 {from_user} 取消关注了公众号。")
+                return make_response("", 200) # 取消关注事件不需要回复
+
+            else:
+                logger.warning(f"接收到未处理的事件类型: {event_type} for user: {from_user}")
+                return build_reply(from_user, to_user, UNSUPPORTED_MESSAGE_TYPE_REPLY)
+
+        else:
+            logger.warning(f"接收到不支持的消息类型: {msg_type} for user: {from_user}")
+            return build_reply(from_user, to_user, UNSUPPORTED_MESSAGE_TYPE_REPLY)
+
+    except Exception as e:
+        logger.error(f"处理微信消息时发生异常: {e}\n{traceback.format_exc()}")
+        safe_from_user = from_user if from_user else 'unknown_user'
+        safe_to_user = to_user if to_user else 'unknown_app'
+        error_xml_str = f"""<xml>
+            <ToUserName><![CDATA[{safe_from_user}]]></ToUserName>
+            <FromUserName><![CDATA[{safe_to_user}]]></FromUserName>
+            <CreateTime>{int(time.time())}</CreateTime>
+            <MsgType><![CDATA[text]]></MsgType>
+            <Content><![CDATA[{SERVER_INTERNAL_ERROR_REPLY}]]></Content>
+        </xml>"""
+        return make_response(error_xml_str, 500, {'Content-Type': 'application/xml'})
+
+# ==================== 后台图片处理及辅助函数 ====================
+def async_process_image(pic_url: str, from_user: str, to_user: str):
+    """
+    异步处理图片消息：下载、识别、存储结果。
+    """
+    try:
+        logger.info(f"后台线程开始处理图片 (URL 头部): {pic_url[:50]}... for user: {from_user}")
+        start_overall_time = time.time()
+        start_download_time = time.time()
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36'}
+        image_data = None
+
+        try:
+            image_resp = requests.get(pic_url, timeout=IMAGE_DOWNLOAD_TIMEOUT, headers=headers, stream=True, allow_redirects=False)
+            image_resp.raise_for_status()
+
+            if image_resp.status_code in (301, 302, 303, 307, 308):
+                redirect_url = image_resp.headers.get('Location')
+                if redirect_url:
+                    redirect_url = urljoin(pic_url, redirect_url)
+                    if not is_safe_url(redirect_url):
+                        logger.warning(f"检测到不安全的图片URL重定向，拒绝处理: {pic_url[:50]}... -> {redirect_url[:50]}... for user: {from_user}")
+                        redis_client.set(f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}", f"{int(time.time())}|ERROR:{UNSAFE_URL_REPLY}", ex=AI_RESULT_EXPIRATION_SECONDS)
+                        image_resp.close()
+                        return
+                    logger.info(f"图片URL重定向到安全地址: {pic_url[:50]}... -> {redirect_url[:50]}... for user: {from_user}")
+                    image_resp.close()
+                    image_resp = requests.get(redirect_url, timeout=IMAGE_DOWNLOAD_TIMEOUT, headers=headers, stream=True)
+                    image_resp.raise_for_status()
+                else:
+                    logger.warning(f"图片URL发生重定向但未找到Location头: {pic_url[:50]}... for user: {from_user}")
+                    redis_client.set(f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}", f"{int(time.time())}|ERROR:{IMAGE_DOWNLOAD_FAILED_REPLY} (重定向失败)", ex=AI_RESULT_EXPIRATION_SECONDS)
+                    image_resp.close()
+                    return
+
+            downloaded_size = 0
+            image_bytes_buffer = io.BytesIO()
+            for chunk in image_resp.iter_content(chunk_size=8192):
+                if chunk:
+                    downloaded_size += len(chunk)
+                    if downloaded_size > MAX_IMAGE_DOWNLOAD_SIZE:
+                        logger.warning(f"图片文件过大 ({downloaded_size/1024/1024:.2f}MB)，超过 {MAX_IMAGE_DOWNLOAD_SIZE/1024/1024:.2f}MB 限制，中断下载 for user: {from_user}")
+                        redis_client.set(f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}", f"{int(time.time())}|ERROR:{IMAGE_DOWNLOAD_FAILED_REPLY} (文件过大)", ex=AI_RESULT_EXPIRATION_SECONDS)
+                        image_resp.close()
+                        return
+                    image_bytes_buffer.write(chunk)
+            image_data = image_bytes_buffer.getvalue()
+            image_resp.close()
+
+            if not image_data:
+                 raise ValueError("下载的图片数据为空。")
+
+            logger.info(f"后台图片下载完成，耗时: {time.time()-start_download_time:.2f}秒，大小: {len(image_data)/1024:.2f}KB。")
+        except requests.exceptions.Timeout:
+            logger.error(f"后台图片下载超时 for user {from_user} (URL 头部: {pic_url[:50]}...): 请求超时")
+            redis_client.set(f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}", f"{int(time.time())}|ERROR:{IMAGE_DOWNLOAD_FAILED_REPLY} (下载超时)", ex=AI_RESULT_EXPIRATION_SECONDS)
+            return
+        except requests.exceptions.RequestException as e:
+            logger.error(f"后台图片下载失败 for user {from_user} (URL 头部: {pic_url[:50]}...): {e}\n{traceback.format_exc()}")
+            redis_client.set(f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}", f"{int(time.time())}|ERROR:{IMAGE_DOWNLOAD_FAILED_REPLY}", ex=AI_RESULT_EXPIRATION_SECONDS)
+            return
+        except ValueError as e:
+            logger.error(f"图片下载或处理初始阶段失败 for user {from_user}: {e}\n{traceback.format_exc()}")
+            redis_client.set(f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}", f"{int(time.time())}|ERROR:{IMAGE_DOWNLOAD_FAILED_REPLY}", ex=AI_RESULT_EXPIRATION_SECONDS)
+            return
+
+        try:
+            img = Image.open(io.BytesIO(image_data))
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+        except Exception as e:
+            logger.error(f"无法打开或转换图片数据 for user {from_user}: {e}\n{traceback.format_exc()}")
+            redis_client.set(f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}", f"{int(time.time())}|ERROR:{IMAGE_PROCESSING_FAILED_REPLY} (图片格式或损坏)", ex=AI_RESULT_EXPIRATION_SECONDS)
+            return
+
+        prompt = "请用中文详细描述这张图片的内容，并尽可能分析它的含义。请直接给出描述，不要说“这张图片显示了...”之类的引导语。"
+        logger.info(f"后台调用 Gemini 处理图片 for user: {from_user}...")
+        ai_response_content = generate_with_retry(prompt, img, is_image_context=True)
+
+        logger.info(f"后台AI处理图片完成 for user: {from_user}，总耗时: {time.time()-start_overall_time:.2f}秒。回复内容长度: {len(ai_response_content.encode('utf-8'))}字节")
+
+        redis_key = f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}"
+        value = f"{int(time.time())}|{ai_response_content}"
+
+        try:
+            redis_client.set(redis_key, value, ex=AI_RESULT_EXPIRATION_SECONDS)
+            logger.info(f"AI图片结果已为用户 {from_user} 存储到 Redis (key: {redis_key})，有效期 {AI_RESULT_EXPIRATION_SECONDS} 秒。")
+        except redis.exceptions.ConnectionError as e:
+            logger.error(f"无法将 AI 图片结果存储到 Redis (连接错误): {e}")
+        except Exception as e:
+            logger.error(f"存储 AI 图片结果到 Redis 时发生未知错误: {e}\n{traceback.format_exc()}")
+
+    except Exception as e:
+        logger.error(f"后台图片处理线程发生未捕获异常 for user {from_user}: {e}\n{traceback.format_exc()}")
+        redis_client.set(f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}", f"{int(time.time())}|ERROR:{IMAGE_PROCESSING_FAILED_REPLY}", ex=AI_RESULT_EXPIRATION_SECONDS)
 
 
 def query_image_result(from_user: str, to_user: str) -> requests.Response:
