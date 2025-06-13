@@ -1,10 +1,11 @@
-flask==2.1.2
+flask
 google-generativeai
-httpx==0.23.0
+httpx
 requests
-Werkzeug==2.0.3
+Werkzeug
 Pillow
 gunicorn
 defusedxml
 olefile
 redis
+python-json-logger
