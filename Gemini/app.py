@@ -20,7 +20,9 @@ from urllib.parse import urlparse, urljoin
 import socket
 from typing import Union
 import json
-from pythonjsonlogger import jsonlogger # 新增导入
+from pythonjsonlogger import jsonlogger
+from concurrent.futures import ThreadPoolExecutor
+from logging.handlers import TimedRotatingFileHandler
 
 app = Flask(__name__)
 
@@ -56,6 +58,7 @@ AI_RESULT_EXPIRATION_SECONDS = 5 * 60  # 图片识别结果缓存时间
 TEXT_CACHE_EXPIRATION_SECONDS = 5 * 60  # 文本回复缓存时间
 
 # AI 模型配置参数 (可从环境变量配置)
+GEMINI_MODEL_NAME = os.environ.get('GEMINI_MODEL_NAME', 'gemini-2.0-flash') # 新增：AI模型名称
 GEMINI_TEMPERATURE = float(os.environ.get('GEMINI_TEMPERATURE', 0.7))
 GEMINI_TOP_P = float(os.environ.get('GEMINI_TOP_P', 0.9))
 GEMINI_TOP_K = int(os.environ.get('GEMINI_TOP_K', 40))
@@ -91,36 +94,39 @@ MAX_IMG_HEIGHT = 4000 # 生成图片的最大高度，防止生成超大图片
 FONT_SIZE = 24
 LINE_SPACING_FACTOR = 0.5 # 行间距与字体大小的比例
 IMAGE_PADDING = 30 # 图片内边距
+LOG_DIR = os.environ.get('LOG_DIR', './logs') # 日志文件存放目录
 
 # ==================== 初始化配置 ====================
 def setup_logging():
     """配置详细的日志记录系统，输出为 JSON 格式"""
-    # 定义 JSON 格式的日志字段
-    # 注意：fields 顺序决定了 JSON 中键的顺序，但实际中顺序可能不严格保证
     log_format = '%(asctime)s %(levelname)s %(filename)s:%(lineno)d %(message)s'
 
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.DEBUG)
 
+    if not os.path.exists(LOG_DIR):
+        os.makedirs(LOG_DIR)
+
     if not logger.handlers:
-        # 控制台输出 handler
         console_handler = logging.StreamHandler()
         console_handler.setLevel(logging.INFO)
-        # 使用 JsonFormatter
         formatter = jsonlogger.JsonFormatter(log_format,
                                              rename_fields={'levelname': 'level', 'asctime': 'timestamp', 'filename': 'file', 'lineno': 'line'},
-                                             json_ensure_ascii=False) # 确保中文不会被转义
+                                             json_ensure_ascii=False)
         console_handler.setFormatter(formatter)
         logger.addHandler(console_handler)
 
-        # 文件输出 handler
-        file_handler = logging.FileHandler(
-            filename=f'wechat_gemini_{datetime.now().strftime("%Y%m%d")}.log',
+        # 使用 TimedRotatingFileHandler 实现按天轮转日志
+        file_handler = TimedRotatingFileHandler(
+            filename=os.path.join(LOG_DIR, 'wechat_gemini.log'), # 文件名不再包含日期，轮转器会自动添加
+            when='midnight', # 每天午夜轮转
+            interval=1,      # 每1天轮转一次
+            backupCount=7,   # 保留最近7天的日志文件
             encoding='utf-8',
-            mode='a'
+            delay=True       # 延迟文件创建，直到第一条日志
         )
         file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(formatter) # 文件输出也使用 JsonFormatter
+        file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
 
     return logger
@@ -151,20 +157,31 @@ APPSECRET = os.environ['WECHAT_APPSECRET']
 
 FONT_PATH = os.environ.get('FONT_PATH', './SourceHanSansSC-Regular.otf')
 
-if not os.path.exists(FONT_PATH):
-    logger.critical(f"字体文件不存在: {FONT_PATH}，请确保已下载并放置在应用根目录或设置正确的路径。")
+# 字体加载逻辑优化
+try:
+    if FONT_PATH and os.path.exists(FONT_PATH):
+        font_global = ImageFont.truetype(FONT_PATH, FONT_SIZE)
+        logger.info(f"成功加载字体文件: {FONT_PATH}")
+    else:
+        font_global = ImageFont.load_default()
+        logger.warning(f"字体文件不存在或未指定: {FONT_PATH}，将使用 Pillow 默认字体，中文显示可能不正常。")
+        FONT_PATH = None # 标记为使用默认字体
+except Exception as e:
+    logger.critical(f"加载字体失败: {e}\n{traceback.format_exc()}")
+    # 尝试加载默认字体作为备用
     try:
-        ImageFont.load_default()
-        logger.warning("字体文件未找到，将使用 Pillow 默认字体，中文显示可能不正常。")
+        font_global = ImageFont.load_default()
+        logger.warning("加载指定字体失败，已回退到 Pillow 默认字体，中文显示可能不正常。")
         FONT_PATH = None
-    except Exception as e:
-        logger.critical(f"加载默认字体也失败: {e}")
-        raise FileNotFoundError(f"字体文件不存在: {FONT_PATH} 且无法加载默认字体。")
+    except Exception as default_font_e:
+        logger.critical(f"加载默认字体也失败: {default_font_e}")
+        raise RuntimeError(f"无法加载任何可用字体: {e}, {default_font_e}")
+
 
 try:
     genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel('gemini-2.0-flash')
-    logger.info("Gemini AI 模型 (gemini-2.0-flash) 初始化成功。")
+    gemini_model = genai.GenerativeModel(GEMINI_MODEL_NAME) # 使用环境变量配置的模型名称
+    logger.info(f"Gemini AI 模型 ({GEMINI_MODEL_NAME}) 初始化成功。")
 except Exception as e:
     logger.critical(f"Gemini 初始化失败: {str(e)}\n{traceback.format_exc()}")
     raise RuntimeError("Gemini AI 模型初始化失败，请检查API密钥和网络连接。")
@@ -177,30 +194,97 @@ REDIS_PASSWORD = os.environ.get('REDIS_PASSWORD')
 REDIS_MAX_CONNECTIONS = int(os.environ.get('REDIS_MAX_CONNECTIONS', 20))
 REDIS_CONNECT_TIMEOUT = int(os.environ.get('REDIS_CONNECT_TIMEOUT', 5))
 REDIS_SOCKET_TIMEOUT = int(os.environ.get('REDIS_SOCKET_TIMEOUT', 5))
-REDIS_HEALTH_CHECK_INTERVAL = int(os.environ.get('REDIS_HEALTH_CHECK_INTERVAL', 30))
+REDIS_HEALTH_CHECK_INTERVAL = int(os.environ.get('REDIS_HEALTH_CHECK_INTERVAL', 30)) # 秒
 
-try:
-    REDIS_CONNECTION_POOL = redis.ConnectionPool(
-        host=REDIS_HOST,
-        port=REDIS_PORT,
-        db=REDIS_DB,
-        password=REDIS_PASSWORD,
-        max_connections=REDIS_MAX_CONNECTIONS,
-        socket_connect_timeout=REDIS_CONNECT_TIMEOUT,
-        socket_timeout=REDIS_SOCKET_TIMEOUT,
-        decode_responses=True,
-        health_check_interval=REDIS_HEALTH_CHECK_INTERVAL,
-        retry_on_timeout=True
-    )
-    redis_client = redis.Redis(connection_pool=REDIS_CONNECTION_POOL)
-    redis_client.ping()
-    logger.info(f"成功连接到 Redis 服务器: {REDIS_HOST}:{REDIS_PORT} (DB: {REDIS_DB}, 连接池大小: {REDIS_CONNECTION_POOL.max_connections})")
-except redis.exceptions.ConnectionError as e:
-    logger.critical(f"无法连接到 Redis 服务器: {e}")
-    raise RuntimeError(f"无法连接到 Redis 服务器: {e}")
-except Exception as e:
-    logger.critical(f"Redis 初始化失败: {e}")
-    raise RuntimeError(f"Redis 初始化失败: {e}")
+# Redis 连接池和客户端，在启动时初始化一次
+REDIS_CONNECTION_POOL = None
+redis_client = None
+redis_health_thread = None
+redis_connection_lock = threading.Lock() # 用于保护Redis连接池和客户端的初始化
+
+def init_redis_client():
+    global REDIS_CONNECTION_POOL, redis_client
+    with redis_connection_lock:
+        # 检查现有连接是否仍然有效且未被关闭
+        if redis_client:
+            try:
+                redis_client.ping()
+                logger.info("Redis客户端已存在且连接正常，无需重新初始化。")
+                return True
+            except redis.exceptions.ConnectionError:
+                logger.warning("现有Redis连接已失效，尝试重新初始化。")
+            except Exception as e:
+                logger.warning(f"检查现有Redis连接时发生异常: {e}，尝试重新初始化。")
+
+        logger.info(f"尝试连接到 Redis 服务器: {REDIS_HOST}:{REDIS_PORT}...")
+        try:
+            REDIS_CONNECTION_POOL = redis.ConnectionPool(
+                host=REDIS_HOST,
+                port=REDIS_PORT,
+                db=REDIS_DB,
+                password=REDIS_PASSWORD,
+                max_connections=REDIS_MAX_CONNECTIONS,
+                socket_connect_timeout=REDIS_CONNECT_TIMEOUT,
+                socket_timeout=REDIS_SOCKET_TIMEOUT,
+                decode_responses=True,
+                health_check_interval=REDIS_HEALTH_CHECK_INTERVAL,
+                retry_on_timeout=True
+            )
+            redis_client = redis.Redis(connection_pool=REDIS_CONNECTION_POOL)
+            redis_client.ping() # 尝试ping，确认连接可用
+            logger.info(f"成功连接到 Redis 服务器: {REDIS_HOST}:{REDIS_PORT} (DB: {REDIS_DB}, 连接池大小: {REDIS_CONNECTION_POOL.max_connections})")
+            return True
+        except redis.exceptions.ConnectionError as e:
+            logger.critical(f"无法连接到 Redis 服务器: {e}")
+            return False
+        except Exception as e:
+            logger.critical(f"Redis 初始化失败: {e}")
+            return False
+
+def redis_health_check_task():
+    """后台 Redis 健康检查任务，如果连接断开则尝试重连。"""
+    while True:
+        try:
+            if redis_client:
+                redis_client.ping()
+                logger.debug("Redis 健康检查：连接正常。")
+            else:
+                logger.warning("Redis客户端未初始化或已断开，尝试重新初始化。")
+                if not init_redis_client():
+                    logger.error("Redis重连失败，将在下次检查时重试。")
+        except redis.exceptions.ConnectionError as e:
+            logger.error(f"Redis 健康检查失败，连接断开: {e}。尝试重新初始化连接。")
+            if not init_redis_client():
+                logger.error("Redis重连失败，将在下次检查时重试。")
+        except Exception as e:
+            logger.error(f"Redis 健康检查过程中发生未知异常: {e}\n{traceback.format_exc()}")
+        time.sleep(REDIS_HEALTH_CHECK_INTERVAL)
+
+# 在应用启动时初始化 Redis 客户端并启动健康检查线程
+if not init_redis_client():
+    raise RuntimeError("初始 Redis 连接失败，服务无法启动。")
+
+redis_health_thread = threading.Thread(target=redis_health_check_task, daemon=True)
+redis_health_thread.start()
+logger.info("Redis 健康检查线程已启动。")
+
+
+# ==================== 线程池配置 ====================
+# 为异步图片处理创建线程池
+# 注意：在生产环境中，线程池的关闭应由 WSGI 服务器（如 Gunicorn）的信号处理机制来管理，
+# 而不应在 Flask 的 teardown_appcontext 中调用 shutdown()，因为后者是为每个请求上下文调用的。
+# 在使用 app.run() 的开发模式下，线程池会在程序退出时由 Python 自动清理。
+MAX_WORKER_THREADS = int(os.environ.get('MAX_WORKER_THREADS', 5))
+executor = ThreadPoolExecutor(max_workers=MAX_WORKER_THREADS)
+logger.info(f"初始化 ThreadPoolExecutor，最大工作线程数: {MAX_WORKER_THREADS}")
+
+# ==================== Requests 会话复用 ====================
+# 创建可复用的requests会话
+# 注意：这些会话是全局资源，它们的关闭应由 WSGI 服务器的生命周期管理。
+# 在使用 app.run() 的开发模式下，这些会话会在程序退出时由 Python 自动清理。
+wechat_api_session = requests.Session()
+image_download_session = requests.Session()
+logger.info("requests 会话已创建，用于复用连接。")
 
 
 # ==================== 核心功能 - Access Token ====================
@@ -213,7 +297,7 @@ def get_access_token() -> Union[str, None]:
     """
     now = int(time.time())
     with token_lock:
-        # 提前一分钟刷新，避免临期失效
+        # 在过期前60秒刷新，避免临近过期时才刷新
         if access_token_cache["token"] and access_token_cache["expires_at"] > now + 60:
             logger.debug("使用缓存的access_token。")
             return access_token_cache["token"]
@@ -222,7 +306,8 @@ def get_access_token() -> Union[str, None]:
     start_time = time.time()
     try:
         url = f"https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid={APPID}&secret={APPSECRET}"
-        resp = requests.get(url, timeout=WECHAT_ACCESS_TOKEN_TIMEOUT)
+        # 使用复用的会话
+        resp = wechat_api_session.get(url, timeout=WECHAT_ACCESS_TOKEN_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
 
@@ -273,7 +358,7 @@ def is_private_ip(ip_str: str) -> bool:
         ip = ipaddress.ip_address(ip_str)
         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
             return True
-        # 额外检查一些可能不在上述属性中的特殊保留地址，如 0.0.0.0/8
+        # 增加对 0.0.0.0/8 这种特殊地址的判断，虽然通常会作为私有或保留
         if ipaddress.ip_network('0.0.0.0/8').overlaps(ipaddress.ip_network(ip)):
             return True
         return False
@@ -300,6 +385,7 @@ def is_safe_url(url: str, dns_timeout: int = DNS_RESOLVE_TIMEOUT) -> bool:
             logger.warning(f"URL缺少主机名: {url[:100]}...")
             return False
 
+        # 允许标准HTTP/HTTPS端口，拒绝其他端口以增加安全性
         if parsed_url.port is not None and parsed_url.port not in (80, 443):
             logger.warning(f"非标准或不安全的URL端口: {parsed_url.port} for URL: {url[:100]}...")
             return False
@@ -309,9 +395,9 @@ def is_safe_url(url: str, dns_timeout: int = DNS_RESOLVE_TIMEOUT) -> bool:
 
         resolved_ips = set()
         try:
-            # 尝试直接解析主机名，如果它是 IP 地址，直接检查
+            # 直接判断是否是IP地址，避免对IP地址进行DNS解析
             if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", parsed_url.hostname) or \
-               re.match(r"^([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$", parsed_url.hostname): # 简单的IPv6判断
+               re.match(r"^([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$", parsed_url.hostname):
                 if is_private_ip(parsed_url.hostname):
                     logger.warning(f"URL主机是私有IP地址: {parsed_url.hostname} for URL: {url[:100]}...")
                     return False
@@ -326,7 +412,7 @@ def is_safe_url(url: str, dns_timeout: int = DNS_RESOLVE_TIMEOUT) -> bool:
 
                 for info in addr_info:
                     ip_address = info[4][0]
-                    if ip_address not in resolved_ips: # 避免重复检查同一IP
+                    if ip_address not in resolved_ips:
                         resolved_ips.add(ip_address)
                         if is_private_ip(ip_address):
                             logger.warning(f"URL主机名 '{parsed_url.hostname}' 解析到私有IP地址: {ip_address} for URL: {url[:100]}...")
@@ -368,13 +454,13 @@ def handle_message():
         msg_type = msg_type_element.text
 
         from_user_element = xml.find('FromUserName')
-        if from_user_element is None or not from_user_element.text: # 修正 === 为 is None
+        if from_user_element is None or not from_user_element.text:
             logger.error("XML消息中缺少 FromUserName 字段或为空。")
             return make_response("Invalid XML: Missing FromUserName", 400)
         from_user = from_user_element.text
 
         to_user_element = xml.find('ToUserName')
-        if to_user_element is None or not to_user_element.text: # 修正 === 为 is None
+        if to_user_element is None or not to_user_element.text:
             logger.error("XML消息中缺少 ToUserName 字段或为空。")
             return make_response("Invalid XML: Missing ToUserName", 400)
         to_user = to_user_element.text
@@ -383,7 +469,7 @@ def handle_message():
 
         if msg_type == 'text':
             content_element = xml.find('Content')
-            if content_element is None or not content_element.text:
+            if content_element == None or not content_element.text:
                 logger.error(f"文本消息中缺少 Content 字段或为空 for user: {from_user}")
                 return build_reply(from_user, to_user, "抱歉，收到的文本消息内容为空。")
             content = content_element.text
@@ -402,11 +488,20 @@ def handle_message():
                 return build_reply(from_user, to_user, "抱歉，收到的图片消息格式不完整。")
             pic_url = pic_url_element.text
 
+            # 在提交到线程池之前进行初步的URL安全检查
             if not is_safe_url(pic_url):
                 logger.warning(f"检测到不安全的图片URL，拒绝处理: {pic_url[:100]}... for user: {from_user}")
-                redis_client.set(f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}",
-                                  f"{int(time.time())}|ERROR:{UNSAFE_URL_REPLY}",
-                                  ex=AI_RESULT_EXPIRATION_SECONDS)
+                # 存储错误信息，以便用户查询时能得到反馈
+                try:
+                    # 确保 Redis 客户端可用
+                    if redis_client and redis_client.ping():
+                        redis_client.set(f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}",
+                                        f"{int(time.time())}|ERROR:{UNSAFE_URL_REPLY}",
+                                        ex=AI_RESULT_EXPIRATION_SECONDS)
+                    else:
+                        logger.error("Redis客户端不可用，无法记录图片安全检查失败信息。")
+                except Exception as redis_e:
+                    logger.error(f"设置Redis图片安全检查失败信息时出错: {redis_e}")
                 return build_reply(from_user, to_user, UNSAFE_URL_REPLY)
 
             logger.info(f"接收到图片消息, URL 头部: {pic_url[:50]}... for user: {from_user}")
@@ -419,13 +514,16 @@ def handle_message():
                 <Content><![CDATA[{INITIAL_IMAGE_PROCESSING_MESSAGE}]]></Content>
             </xml>"""
 
-            threading.Thread(target=async_process_image, args=(pic_url, from_user, to_user)).start()
+            # 使用线程池提交任务
+            # 注意：这里提交任务前不应检查executor是否shutdown，因为executor是全局资源，
+            # 只有在整个应用进程关闭时才应该shutdown。
+            executor.submit(async_process_image, pic_url, from_user, to_user)
+            logger.info(f"图片处理任务已提交到线程池 for user: {from_user}")
 
             return make_response(reply_xml_str, 200, {'Content-Type': 'application/xml'})
         
         elif msg_type == 'voice':
             recognition_element = xml.find('Recognition')
-            # media_id_element = xml.find('MediaId') # 如果需要MediaId，可以在这里获取
 
             recognition_content = ""
             if recognition_element is not None and recognition_element.text:
@@ -442,7 +540,7 @@ def handle_message():
                 logger.warning(f"语音识别结果为空，无法处理 for user: {from_user}")
                 return build_reply(from_user, to_user, VOICE_MESSAGE_EMPTY_RESULT_REPLY)
 
-        elif msg_type == 'event': # 新增事件处理
+        elif msg_type == 'event':
             event_element = xml.find('Event')
             if event_element is None or not event_element.text:
                 logger.error(f"事件消息中缺少 Event 字段或为空 for user: {from_user}")
@@ -457,7 +555,7 @@ def handle_message():
                 return build_reply(from_user, to_user, WELCOME_MESSAGE_REPLY)
             elif event_type == 'unsubscribe':
                 logger.info(f"用户 {from_user} 取消关注了公众号。")
-                return make_response("", 200) # 取消关注事件不需要回复
+                return make_response("", 200)
 
             else:
                 logger.warning(f"接收到未处理的事件类型: {event_type} for user: {from_user}")
@@ -471,12 +569,14 @@ def handle_message():
         logger.error(f"处理微信消息时发生异常: {e}\n{traceback.format_exc()}")
         safe_from_user = from_user if from_user else 'unknown_user'
         safe_to_user = to_user if to_user else 'unknown_app'
+        # 确保 CDATA 块内容安全，替换内部的 `]]>`
+        error_content = SERVER_INTERNAL_ERROR_REPLY.replace(']]>', ']]]]><![CDATA[>')
         error_xml_str = f"""<xml>
             <ToUserName><![CDATA[{safe_from_user}]]></ToUserName>
             <FromUserName><![CDATA[{safe_to_user}]]></FromUserName>
             <CreateTime>{int(time.time())}</CreateTime>
             <MsgType><![CDATA[text]]></MsgType>
-            <Content><![CDATA[{SERVER_INTERNAL_ERROR_REPLY}]]></Content>
+            <Content><![CDATA[{error_content}]]></Content>
         </xml>"""
         return make_response(error_xml_str, 500, {'Content-Type': 'application/xml'})
 
@@ -485,6 +585,16 @@ def async_process_image(pic_url: str, from_user: str, to_user: str):
     """
     异步处理图片消息：下载、识别、存储结果。
     """
+    if not redis_client or not init_redis_client(): # 再次检查并尝试重新初始化，以防连接在函数开始前断开
+        logger.error(f"Redis客户端不可用，无法处理图片识别请求 for user: {from_user} (URL 头部: {pic_url[:50]}...)")
+        # 即使无法写入Redis，也要记录日志
+        try:
+            # 尝试写入，如果失败也不中断主流程
+            redis_client.set(f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}", f"{int(time.time())}|ERROR:{NO_REDIS_CONNECTION_REPLY}", ex=AI_RESULT_EXPIRATION_SECONDS)
+        except Exception as redis_e:
+            logger.error(f"设置Redis图片处理失败信息时出错 (Redis连接断开): {redis_e}")
+        return
+
     try:
         logger.info(f"后台线程开始处理图片 (URL 头部): {pic_url[:50]}... for user: {from_user}")
         start_overall_time = time.time()
@@ -493,21 +603,23 @@ def async_process_image(pic_url: str, from_user: str, to_user: str):
         image_data = None
 
         try:
-            image_resp = requests.get(pic_url, timeout=IMAGE_DOWNLOAD_TIMEOUT, headers=headers, stream=True, allow_redirects=False)
+            # 使用复用的会话进行图片下载
+            image_resp = image_download_session.get(pic_url, timeout=IMAGE_DOWNLOAD_TIMEOUT, headers=headers, stream=True, allow_redirects=False)
             image_resp.raise_for_status()
 
+            # 检查重定向，并对重定向URL进行安全验证
             if image_resp.status_code in (301, 302, 303, 307, 308):
                 redirect_url = image_resp.headers.get('Location')
                 if redirect_url:
-                    redirect_url = urljoin(pic_url, redirect_url)
-                    if not is_safe_url(redirect_url):
-                        logger.warning(f"检测到不安全的图片URL重定向，拒绝处理: {pic_url[:50]}... -> {redirect_url[:50]}... for user: {from_user}")
+                    full_redirect_url = urljoin(pic_url, redirect_url)
+                    if not is_safe_url(full_redirect_url): # 对重定向后的URL进行安全检查
+                        logger.warning(f"检测到不安全的图片URL重定向，拒绝处理: {pic_url[:50]}... -> {full_redirect_url[:50]}... for user: {from_user}")
                         redis_client.set(f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}", f"{int(time.time())}|ERROR:{UNSAFE_URL_REPLY}", ex=AI_RESULT_EXPIRATION_SECONDS)
                         image_resp.close()
                         return
-                    logger.info(f"图片URL重定向到安全地址: {pic_url[:50]}... -> {redirect_url[:50]}... for user: {from_user}")
+                    logger.info(f"图片URL重定向到安全地址: {pic_url[:50]}... -> {full_redirect_url[:50]}... for user: {from_user}")
                     image_resp.close()
-                    image_resp = requests.get(redirect_url, timeout=IMAGE_DOWNLOAD_TIMEOUT, headers=headers, stream=True)
+                    image_resp = image_download_session.get(full_redirect_url, timeout=IMAGE_DOWNLOAD_TIMEOUT, headers=headers, stream=True)
                     image_resp.raise_for_status()
                 else:
                     logger.warning(f"图片URL发生重定向但未找到Location头: {pic_url[:50]}... for user: {from_user}")
@@ -562,25 +674,37 @@ def async_process_image(pic_url: str, from_user: str, to_user: str):
         logger.info(f"后台AI处理图片完成 for user: {from_user}，总耗时: {time.time()-start_overall_time:.2f}秒。回复内容长度: {len(ai_response_content.encode('utf-8'))}字节")
 
         redis_key = f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}"
-        value = f"{int(time.time())}|{ai_response_content}"
+        # 确保写入 Redis 的内容不会破坏格式
+        value = f"{int(time.time())}|{ai_response_content.replace('|', '&#124;')}" # 替换管道符避免解析问题
 
         try:
             redis_client.set(redis_key, value, ex=AI_RESULT_EXPIRATION_SECONDS)
             logger.info(f"AI图片结果已为用户 {from_user} 存储到 Redis (key: {redis_key})，有效期 {AI_RESULT_EXPIRATION_SECONDS} 秒。")
         except redis.exceptions.ConnectionError as e:
-            logger.error(f"无法将 AI 图片结果存储到 Redis (连接错误): {e}")
+            logger.error(f"无法将 AI 图片结果存储到 Redis (连接错误): {e}。用户将无法查询到结果。")
         except Exception as e:
-            logger.error(f"存储 AI 图片结果到 Redis 时发生未知错误: {e}\n{traceback.format_exc()}")
+            logger.error(f"存储 AI 图片结果到 Redis 时发生未知错误: {e}\n{traceback.format_exc()}。用户将无法查询到结果。")
 
     except Exception as e:
         logger.error(f"后台图片处理线程发生未捕获异常 for user {from_user}: {e}\n{traceback.format_exc()}")
-        redis_client.set(f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}", f"{int(time.time())}|ERROR:{IMAGE_PROCESSING_FAILED_REPLY}", ex=AI_RESULT_EXPIRATION_SECONDS)
+        try:
+            # 即使是未捕获异常，也尝试记录到 Redis，让用户可查询到失败原因
+            if redis_client and init_redis_client():
+                redis_client.set(f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}", f"{int(time.time())}|ERROR:{IMAGE_PROCESSING_FAILED_REPLY}", ex=AI_RESULT_EXPIRATION_SECONDS)
+            else:
+                logger.error("Redis客户端不可用，无法记录未捕获异常到Redis。")
+        except Exception as redis_e:
+            logger.error(f"记录未捕获异常到Redis时出错: {redis_e}")
 
 
 def query_image_result(from_user: str, to_user: str) -> requests.Response:
     """
     查询用户存储的图片识别结果。
     """
+    if not redis_client or not init_redis_client():
+        logger.error(f"Redis客户端不可用，无法查询图片识别结果 for user: {from_user}")
+        return build_reply(from_user, to_user, NO_REDIS_CONNECTION_REPLY)
+
     redis_key = f"{REDIS_USER_AI_RESULT_PREFIX}{from_user}"
     stored_value = None
     try:
@@ -597,6 +721,7 @@ def query_image_result(from_user: str, to_user: str) -> requests.Response:
         try:
             timestamp_str, content = stored_value.split('|', 1)
             timestamp = int(timestamp_str)
+            content = content.replace('&#124;', '|') # 恢复管道符
 
             if content.startswith("ERROR:"):
                 error_message = content[6:]
@@ -627,26 +752,32 @@ def process_text_message(content: str) -> str:
     normalized_content = content.strip().lower()
     cache_key = f"{REDIS_TEXT_CACHE_PREFIX}{hashlib.md5(normalized_content.encode('utf-8')).hexdigest()}"
 
-    try:
-        cached_answer = redis_client.get(cache_key)
-        if cached_answer:
-            logger.info(f"从 Redis 缓存中获取文本答案 (key: {cache_key[:10]}...): {cached_answer[:50]}...")
-            return cached_answer
-    except redis.exceptions.ConnectionError as e:
-        logger.warning(f"无法从 Redis 获取文本缓存 (连接错误): {cache_key}, 错误: {e}")
-    except Exception as e:
-        logger.warning(f"获取文本缓存时发生未知错误: {cache_key}, 错误: {e}\n{traceback.format_exc()}")
+    if redis_client and init_redis_client(): # 再次检查并尝试重新初始化，以防连接在函数开始前断开
+        try:
+            cached_answer = redis_client.get(cache_key)
+            if cached_answer:
+                logger.info(f"从 Redis 缓存中获取文本答案 (key: {cache_key[:10]}...): {cached_answer[:50]}...")
+                return cached_answer
+        except redis.exceptions.ConnectionError as e:
+            logger.warning(f"无法从 Redis 获取文本缓存 (连接错误): {cache_key}, 错误: {e}。将尝试重新生成。")
+        except Exception as e:
+            logger.warning(f"获取文本缓存时发生未知错误: {cache_key}, 错误: {e}\n{traceback.format_exc()}。将尝试重新生成。")
+    else:
+        logger.warning("Redis客户端不可用，跳过文本缓存查询。")
 
     try:
         ai_response_content = generate_with_retry(content, is_image_context=False)
         if ai_response_content:
-            try:
-                redis_client.set(cache_key, ai_response_content, ex=TEXT_CACHE_EXPIRATION_SECONDS)
-                logger.info(f"AI文本答案已存入 Redis 缓存 (key: {cache_key[:10]}...)，有效期 {TEXT_CACHE_EXPIRATION_SECONDS} 秒。")
-            except redis.exceptions.ConnectionError as e:
-                logger.warning(f"无法将 AI 文本答案存储到 Redis (连接错误): {cache_key}, 错误: {e}")
-            except Exception as e:
-                logger.warning(f"存储 AI 文本答案到 Redis 时发生未知错误: {cache_key}, 错误: {e}\n{traceback.format_exc()}")
+            if redis_client and init_redis_client():
+                try:
+                    redis_client.set(cache_key, ai_response_content, ex=TEXT_CACHE_EXPIRATION_SECONDS)
+                    logger.info(f"AI文本答案已存入 Redis 缓存 (key: {cache_key[:10]}...)，有效期 {TEXT_CACHE_EXPIRATION_SECONDS} 秒。")
+                except redis.exceptions.ConnectionError as e:
+                    logger.warning(f"无法将 AI 文本答案存储到 Redis (连接错误): {cache_key}, 错误: {e}")
+                except Exception as e:
+                    logger.warning(f"存储 AI 文本答案到 Redis 时发生未知错误: {cache_key}, 错误: {e}\n{traceback.format_exc()}")
+            else:
+                logger.warning("Redis客户端不可用，跳过文本缓存存储。")
         return ai_response_content
     except Exception as e:
         logger.error(f"处理文本消息时 AI 调用失败: {e}\n{traceback.format_exc()}")
@@ -704,17 +835,20 @@ def build_reply(from_user: str, to_user: str, content: str) -> requests.Response
 
         if content_bytes > WECHAT_TEXT_MAX_BYTES:
             logger.info(f"内容过长({content_bytes}字节 > {WECHAT_TEXT_MAX_BYTES}字节)，尝试转换为图片并回复。")
+            # 文本转图片
             img_data = text_to_image(cleaned_content, max_width=MAX_IMG_WIDTH, font_size=FONT_SIZE, line_spacing_factor=LINE_SPACING_FACTOR)
             if img_data:
                 if len(img_data) > WECHAT_MAX_IMAGE_UPLOAD_SIZE:
                     logger.warning(f"生成的图片大小 ({len(img_data)/1024:.2f}KB) 超过微信上传限制 ({WECHAT_MAX_IMAGE_UPLOAD_SIZE/1024:.2f}KB)。将回退为截断文本。")
-                    truncated_content = clean_content(cleaned_content, max_bytes=WECHAT_TEXT_MAX_BYTES - len(AI_REPLY_TOO_LONG_IMAGE_FAIL_PREFIX.encode('utf-8'))) # 为前缀预留空间
+                    truncated_content = clean_content(cleaned_content, max_bytes=WECHAT_TEXT_MAX_BYTES - len(AI_REPLY_TOO_LONG_IMAGE_FAIL_PREFIX.encode('utf-8')))
+                    # 确保 CDATA 块内容安全，替换内部的 `]]>`
+                    safe_truncated_content = escape_cdata(AI_REPLY_TOO_LONG_IMAGE_FAIL_PREFIX + truncated_content)
                     reply_xml_str = f"""<xml>
                         <ToUserName><![CDATA[{from_user}]]></ToUserName>
                         <FromUserName><![CDATA[{to_user}]]></FromUserName>
                         <CreateTime>{int(time.time())}</CreateTime>
                         <MsgType><![CDATA[text]]></MsgType>
-                        <Content><![CDATA[{escape(AI_REPLY_TOO_LONG_IMAGE_FAIL_PREFIX + truncated_content)}]]></Content>
+                        <Content><![CDATA[{safe_truncated_content}]]></Content>
                     </xml>"""
                 else:
                     media_id = upload_image_to_wechat(img_data)
@@ -730,31 +864,34 @@ def build_reply(from_user: str, to_user: str, content: str) -> requests.Response
                     else:
                         logger.warning("图片上传至微信失败，回退到文本回复并截断。")
                         truncated_content = clean_content(cleaned_content, max_bytes=WECHAT_TEXT_MAX_BYTES - len(AI_REPLY_TOO_LONG_IMAGE_FAIL_PREFIX.encode('utf-8')))
+                        safe_truncated_content = escape_cdata(AI_REPLY_TOO_LONG_IMAGE_FAIL_PREFIX + truncated_content)
                         reply_xml_str = f"""<xml>
                             <ToUserName><![CDATA[{from_user}]]></ToUserName>
                             <FromUserName><![CDATA[{to_user}]]></FromUserName>
                             <CreateTime>{int(time.time())}</CreateTime>
                             <MsgType><![CDATA[text]]></MsgType>
-                            <Content><![CDATA[{escape(AI_REPLY_TOO_LONG_IMAGE_FAIL_PREFIX + truncated_content)}]]></Content>
+                            <Content><![CDATA[{safe_truncated_content}]]></Content>
                         </xml>"""
             else:
                 logger.warning("文本转换为图片失败，回退到文本回复并截断。")
                 truncated_content = clean_content(cleaned_content, max_bytes=WECHAT_TEXT_MAX_BYTES - len(AI_REPLY_TOO_LONG_IMAGE_FAIL_PREFIX.encode('utf-8')))
+                safe_truncated_content = escape_cdata(AI_REPLY_TOO_LONG_IMAGE_FAIL_PREFIX + truncated_content)
                 reply_xml_str = f"""<xml>
                     <ToUserName><![CDATA[{from_user}]]></ToUserName>
                     <FromUserName><![CDATA[{to_user}]]></FromUserName>
                     <CreateTime>{int(time.time())}</CreateTime>
                     <MsgType><![CDATA[text]]></MsgType>
-                    <Content><![CDATA[{escape(AI_REPLY_TOO_LONG_IMAGE_FAIL_PREFIX + truncated_content)}]]></Content>
+                    <Content><![CDATA[{safe_truncated_content}]]></Content>
                 </xml>"""
         else:
             logger.info(f"内容在文本限制内({content_bytes}字节)，使用文本回复。")
+            safe_cleaned_content = escape_cdata(cleaned_content)
             reply_xml_str = f"""<xml>
                 <ToUserName><![CDATA[{from_user}]]></ToUserName>
                 <FromUserName><![CDATA[{to_user}]]></FromUserName>
                 <CreateTime>{int(time.time())}</CreateTime>
                 <MsgType><![CDATA[text]]></MsgType>
-                <Content><![CDATA[{escape(cleaned_content)}]]></Content>
+                <Content><![CDATA[{safe_cleaned_content}]]></Content>
             </xml>"""
         return make_response(reply_xml_str, 200, {'Content-Type': 'application/xml'})
 
@@ -762,14 +899,21 @@ def build_reply(from_user: str, to_user: str, content: str) -> requests.Response
         logger.error(f"构建回复时发生异常: {e}\n{traceback.format_exc()}")
         safe_from_user = from_user if from_user else 'unknown_user'
         safe_to_user = to_user if to_user else 'unknown_app'
+        safe_error_reply = escape_cdata(AI_REPLY_EXCEPTION_REPLY)
         error_xml_str = f"""<xml>
             <ToUserName><![CDATA[{safe_from_user}]]></ToUserName>
             <FromUserName><![CDATA[{safe_to_user}]]></FromUserName>
             <CreateTime>{int(time.time())}</CreateTime>
             <MsgType><![CDATA[text]]></MsgType>
-            <Content><![CDATA[{AI_REPLY_EXCEPTION_REPLY}]]></Content>
+            <Content><![CDATA[{safe_error_reply}]]></Content>
         </xml>"""
         return make_response(error_xml_str, 500, {'Content-Type': 'application/xml'})
+
+def escape_cdata(text: str) -> str:
+    """
+    确保字符串在 CDATA 块中安全，替换 `]]>` 为 `]]]]><![CDATA[>`。
+    """
+    return text.replace(']]>', ']]]]><![CDATA[>')
 
 def clean_content(content: str, max_bytes: Union[int, None] = None) -> str:
     """
@@ -779,28 +923,33 @@ def clean_content(content: str, max_bytes: Union[int, None] = None) -> str:
         return ""
     
     # 移除所有Markdown标记，包括但不限于粗体、斜体、删除线、下划线、代码块、引用、列表、链接、图片
-    # 尽可能保留换行，除非是代码块或多行引用等
+    # 注意：这里的Markdown清理是比较激进的，目的是为了生成纯文本或图片，可能会丢失格式信息。
     content = re.sub(r'```.*?```', '', content, flags=re.DOTALL) # 移除代码块
-    content = re.sub(r'\|.*?\|', '', content) # 移除表格行
-    content = re.sub(r'(\*\*|__|\*|_|`|~~|#+\s*)', '', content) # 粗体、斜体、删除线、下划线、标题
-    content = re.sub(r'\[([^\]]+?)\]\(.*?\)', r'\1', content) # 链接只保留文本
-    content = re.sub(r'!\[.*?\]\(.*?\)', '', content) # 移除图片链接
-    content = re.sub(r'^>\s*', '', content, flags=re.MULTILINE) # 移除引用标记
+    content = re.sub(r'\|.*?\|', '', content) # 移除表格线及内容
+    content = re.sub(r'(\*\*|__|\*|_|`|~~|#+\s*)', '', content) # 移除粗体、斜体、代码、删除线、标题
+    content = re.sub(r'\[([^\]]+?)\]\(.*?\)', r'\1', content) # 移除链接，保留文本
+    content = re.sub(r'!\[.*?\]\(.*?\)', '', content) # 移除图片
+    content = re.sub(r'^[>\s*]\s*', '', content, flags=re.MULTILINE) # 移除引用和列表标记
     content = re.sub(r'^[*-]\s*', '', content, flags=re.MULTILINE) # 移除列表标记
 
     processed_lines = []
+    # 预估每行大致可容纳的字符数，用于 textwrap。
+    # 这里使用一个更通用的方式来预估，避免直接依赖 Pillow 字体，因为 Pillow 默认字体对中文支持不好。
+    # 20 是一个经验值，表示在 MAX_IMG_WIDTH 宽度下大约能容纳的英文字符数，对于中文会少一半。
+    estimated_chars_per_line = int((MAX_IMG_WIDTH - 2 * IMAGE_PADDING) / (FONT_SIZE * 0.5)) if FONT_PATH else 20
+    if estimated_chars_per_line < 10: # 避免过小导致无法分行
+        estimated_chars_per_line = 10
+
     for paragraph in content.split('\n'):
         if not paragraph.strip():
             processed_lines.append('')
             continue
-
-        # 使用 textwrap 智能断行
-        wrapped = textwrap.wrap(paragraph, width=MAX_IMG_WIDTH // (FONT_SIZE // 2)) # 大致估算字符宽度
+        wrapped = textwrap.wrap(paragraph, width=estimated_chars_per_line)
         for line in wrapped:
             processed_lines.append(line.strip())
 
     content = '\n'.join(processed_lines)
-    # 确保没有连续的多个空行，只保留最多两个空行
+    # 移除多余的空行，只保留最多一个空行
     content = re.sub(r'\n{3,}', '\n\n', content)
     content = content.strip()
 
@@ -809,7 +958,7 @@ def clean_content(content: str, max_bytes: Union[int, None] = None) -> str:
         if len(encoded_content) > max_bytes:
             logger.warning(f"内容因字节限制被截断: 原始 {len(encoded_content)} 字节，截断至 {max_bytes} 字节。")
             truncated_bytes = encoded_content[:max_bytes]
-            # 找到最后一个完整的UTF-8字符的边界
+            # 确保截断在 UTF-8 字符边界
             while not truncated_bytes.decode('utf-8', 'ignore').encode('utf-8') == truncated_bytes:
                 truncated_bytes = truncated_bytes[:-1]
             return truncated_bytes.decode('utf-8', 'ignore')
@@ -824,59 +973,67 @@ def text_to_image(text: str, max_width: int = MAX_IMG_WIDTH, font_size: int = FO
         padding = IMAGE_PADDING
         line_spacing = int(font_size * line_spacing_factor)
         
-        font = None
-        if FONT_PATH:
-            font = ImageFont.truetype(FONT_PATH, font_size)
-        else:
-            font = ImageFont.load_default()
+        # 使用全局字体对象
+        font = font_global
+
+        # 准确计算每行文本的宽度和高度，以进行精确的文本布局
+        lines = []
+        current_line = []
+        current_width = 0
+        max_line_width_pixels = max_width - 2 * padding
+
+        for word in text.split(' '): # 简单的按空格分词
+            # 对于中文，一个字可能算一个“词”，这里需要更智能的断行
+            # 如果是纯中文，可以逐字判断
+            # 如果是中英文混合，可以按单词或标点符号切分，然后逐个添加到当前行
+            # 这里的 textwrap.wrap 已经处理了大部分复杂情况，但我们仍需用 getlength 确保不超过像素宽度
+            
+            # 使用textwrap对整体文本进行初步分行
+            # 为了避免二次复杂的文字测量，我们仍然依赖textwrap进行初步分行，然后对分好的行进行像素级别的检查
+            # 重新估算 chars_per_line_estimate，因为这里用的是 font_global
+            # 假设一个英文字符宽度约为 font_size * 0.5，一个中文字符宽度约为 font_size * 1
+            # 取一个中间值，或者直接用 'A' 和 '中' 的宽度来做更准确的平均估算
+            avg_char_width = (font.getbbox('A')[2] - font.getbbox('A')[0] + (font.getbbox('中')[2] - font.getbbox('中')[0])) / 2
+            if avg_char_width == 0: avg_char_width = font_size * 0.7 # 备用值
+
+            estimated_chars_per_line = int(max_line_width_pixels / avg_char_width)
+            if estimated_chars_per_line < 10: estimated_chars_per_line = 10
+
 
         wrapped_lines = []
-        max_line_content_width = max_width - 2 * padding
-
         for paragraph in text.split('\n'):
             if not paragraph.strip():
                 wrapped_lines.append('')
                 continue
-
-            current_line_chars = []
-            current_line_width = 0
-            for char in paragraph:
-                # 使用 getbbox 来获取字符的精确宽度，即使是默认字体也能工作
-                # getbbox returns (left, top, right, bottom)
-                char_bbox = font.getbbox(char)
-                char_width = char_bbox[2] - char_bbox[0] # width is right - left
-
-                if current_line_width + char_width <= max_line_content_width:
-                    current_line_chars.append(char)
-                    current_line_width += char_width
-                else:
-                    if current_line_chars:
-                        wrapped_lines.append("".join(current_line_chars))
-                    current_line_chars = [char]
-                    current_line_width = char_width
-            if current_line_chars:
-                wrapped_lines.append("".join(current_line_chars))
+            wrapped_paragraph = textwrap.wrap(paragraph, width=estimated_chars_per_line)
+            wrapped_lines.extend(wrapped_paragraph)
 
         if not wrapped_lines:
-            wrapped_lines = [""] # 确保即使文本为空也有一行
+            wrapped_lines = [""]
 
-        line_height = font_size + line_spacing
+        # 计算实际行高，考虑了字体自身的 baseline
+        line_height = font.getbbox('Tg')[3] - font.getbbox('Tg')[1] + line_spacing # 使用包含下行字符的文本来获取准确高度
+        if line_height <= 0: # 防止异常
+            line_height = font_size + line_spacing
+
         img_height = 2 * padding + len(wrapped_lines) * line_height
 
         if img_height > MAX_IMG_HEIGHT:
             logger.warning(f"图片高度超过限制 {MAX_IMG_HEIGHT}px，原始高度 {img_height}px，将截断内容。")
-            displayable_lines = int((MAX_IMG_HEIGHT - 2 * padding) / line_height) - 2
+            displayable_lines = int((MAX_IMG_HEIGHT - 2 * padding - (font_size + line_spacing) * 2) / line_height) # 为截断提示预留两行
             
             if displayable_lines < 0:
                 displayable_lines = 0
             
             wrapped_lines = wrapped_lines[:displayable_lines]
             
-            if len(wrapped_lines) > 0 or displayable_lines == 0: # 即使完全截断也加提示
+            # 添加截断提示
+            if len(wrapped_lines) > 0 or displayable_lines == 0: # 确保即使内容很少也会显示提示
                 wrapped_lines.append("...")
                 wrapped_lines.append("(内容过长，已截断)")
             
             img_height = 2 * padding + len(wrapped_lines) * line_height
+
 
         img = Image.new("RGB", (max_width, img_height), (255, 255, 255))
         draw = ImageDraw.Draw(img)
@@ -888,17 +1045,18 @@ def text_to_image(text: str, max_width: int = MAX_IMG_WIDTH, font_size: int = FO
 
         watermark = "AI生成内容"
         watermark_font = None
+        # 使用全局字体或默认字体，但减小尺寸
         if FONT_PATH:
-            watermark_font = ImageFont.truetype(FONT_PATH, int(font_size * 0.8))
+            watermark_font = ImageFont.truetype(FONT_PATH, int(FONT_SIZE * 0.8))
         else:
             watermark_font = ImageFont.load_default()
 
-        # 确保图片有足够的空间绘制水印
-        if img.height >= (watermark_font.getbbox(watermark)[3] - watermark_font.getbbox(watermark)[1] + 20):
-            watermark_bbox = draw.textbbox((0, 0), watermark, font=watermark_font)
-            watermark_width = watermark_bbox[2] - watermark_bbox[0]
-            watermark_height = watermark_bbox[3] - watermark_bbox[1]
+        # 确保水印不会超出图片底部
+        watermark_bbox = draw.textbbox((0, 0), watermark, font=watermark_font)
+        watermark_width = watermark_bbox[2] - watermark_bbox[0]
+        watermark_height = watermark_bbox[3] - watermark_bbox[1]
 
+        if img.height >= (watermark_height + 10): # 确保图片足够高放下水印
             draw.text(
                 (max_width - watermark_width - 15, img_height - watermark_height - 10),
                 watermark,
@@ -935,7 +1093,8 @@ def upload_image_to_wechat(image_bytes: bytes) -> Union[str, None]:
         files = {'media': ('ai_reply.png', image_bytes, 'image/png')}
         logger.info(f"正在上传图片到微信服务器 (大小: {len(image_bytes)/1024:.2f}KB)...")
         start_time_img_upload = time.time()
-        resp = requests.post(url, files=files, timeout=WECHAT_MEDIA_UPLOAD_TIMEOUT)
+        # 使用复用的会话进行微信API调用
+        resp = wechat_api_session.post(url, files=files, timeout=WECHAT_MEDIA_UPLOAD_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
         logger.info(f"图片上传到微信耗时: {time.time()-start_time_img_upload:.2f}秒")
@@ -963,3 +1122,15 @@ def log_request():
             logger.debug(f"请求体: {body_preview}...")
         except Exception:
             logger.debug(f"请求体（无法解码）：{request.data[:500]}...")
+
+# 移除了 @app.teardown_appcontext 中对 executor 和 requests session 的 shutdown 调用
+# 这些资源（线程池、Requests 会话、Redis 连接池）是全局的，应在应用程序进程退出时由 WSGI 服务器（如 Gunicorn）或 Python 解释器进行管理。
+# 在 app.run() 开发模式下，它们会在程序退出时自动清理。
+
+# Flask 应用入口
+if __name__ == '__main__':
+    # 在生产环境中，强烈建议使用Gunicorn等WSGI服务器来运行Flask应用，例如：
+    # gunicorn -w 4 -b 0.0.0.0:80 app:app
+    # 这样可以更好地管理进程生命周期和资源关闭。
+    # app.run() 仅适用于开发环境。
+    app.run(host='0.0.0.0', port=80, debug=False)
